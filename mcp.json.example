@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mode-analytics": {
+      "command": "uvx",
+      "args": ["--from", "git+ssh://git@github.com/nataliemona/mode_mcp", "mode-mcp"],
+      "env": {
+        "MODE_WORKSPACE": "your-workspace-name",
+        "MODE_API_TOKEN": "${MODE_API_TOKEN}",
+        "MODE_API_SECRET": "${MODE_API_SECRET}"
+      }
+    }
+  }
+}
