@@ -652,6 +652,68 @@ async def test_get_run_results_explicit_token():
     async with _test_client() as client:
         result = await server.get_run_results(_mock_ctx(client), "rpt1", "run1")
     assert result[0]["data"] == [{"total": 99}]
+    assert result[0]["row_count"] == 1
+    assert result[0]["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# get_run_results — default truncation kicks in on large payloads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_run_results_truncates_by_default():
+    rows = [{"i": i} for i in range(1200)]
+    respx.get(f"{BASE}/reports/rpt1/runs/run1/query_runs").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal(
+                "query_runs",
+                [{"token": "qr1", "query_name": "big", "state": "succeeded"}],
+            ),
+        )
+    )
+    respx.get(
+        f"{BASE}/reports/rpt1/runs/run1/query_runs/qr1/results/content.json"
+    ).mock(return_value=httpx.Response(200, json=rows))
+
+    async with _test_client() as client:
+        result = await server.get_run_results(_mock_ctx(client), "rpt1", "run1")
+    assert result[0]["row_count"] == 1200
+    assert result[0]["truncated"] is True
+    assert len(result[0]["data"]) == 500
+
+
+# ---------------------------------------------------------------------------
+# get_run_results — max_rows_per_query=None fetches everything
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_run_results_no_truncation():
+    rows = [{"i": i} for i in range(1200)]
+    respx.get(f"{BASE}/reports/rpt1/runs/run1/query_runs").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal(
+                "query_runs",
+                [{"token": "qr1", "query_name": "big", "state": "succeeded"}],
+            ),
+        )
+    )
+    respx.get(
+        f"{BASE}/reports/rpt1/runs/run1/query_runs/qr1/results/content.json"
+    ).mock(return_value=httpx.Response(200, json=rows))
+
+    async with _test_client() as client:
+        result = await server.get_run_results(
+            _mock_ctx(client), "rpt1", "run1", max_rows_per_query=None
+        )
+    assert result[0]["row_count"] == 1200
+    assert result[0]["truncated"] is False
+    assert len(result[0]["data"]) == 1200
 
 
 # ---------------------------------------------------------------------------

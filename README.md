@@ -89,7 +89,7 @@ If/when the package is published, the install line simplifies to:
 
 ```bash
 git clone git@github.com:nataliemona/mode_mcp.git
-cd mode-mcp
+cd mode_mcp
 uv sync --dev
 uv run pytest
 ```

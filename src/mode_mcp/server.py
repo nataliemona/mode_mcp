@@ -569,6 +569,7 @@ async def _fetch_run_results(
     client: httpx.AsyncClient,
     report_token: str,
     run_token: str,
+    max_rows_per_query: int | None = 500,
 ) -> list[dict[str, Any]]:
     """Fetch results for all query runs in a report run."""
     qr_resp = await client.get(f"/reports/{report_token}/runs/{run_token}/query_runs")
@@ -581,30 +582,54 @@ async def _fetch_run_results(
             f"/reports/{report_token}/runs/{run_token}"
             f"/query_runs/{qr_token}/results/content.json"
         )
-        if r.status_code == 200:
+        if r.status_code != 200:
             return {
                 "query_name": qr.get("query_name", ""),
                 "state": qr.get("state"),
-                "data": r.json(),
+                "error": f"HTTP {r.status_code}",
             }
-        return {
+        data = r.json()
+        out: dict[str, Any] = {
             "query_name": qr.get("query_name", ""),
             "state": qr.get("state"),
-            "error": f"HTTP {r.status_code}",
         }
+        if isinstance(data, list):
+            total = len(data)
+            out["row_count"] = total
+            if max_rows_per_query is not None and total > max_rows_per_query:
+                out["data"] = data[:max_rows_per_query]
+                out["truncated"] = True
+            else:
+                out["data"] = data
+                out["truncated"] = False
+        else:
+            # Unexpected non-list payload — pass through unchanged.
+            out["data"] = data
+        return out
 
     return list(await asyncio.gather(*[_fetch_one(qr) for qr in query_runs]))
 
 
 @mcp.tool()
 async def get_run_results(
-    ctx: Context, report_token: str, run_token: str | None = None
+    ctx: Context,
+    report_token: str,
+    run_token: str | None = None,
+    max_rows_per_query: int | None = 500,
 ) -> list[dict[str, Any]]:
     """Get results from a report run. Defaults to the latest run.
+
+    Each query's rows are truncated to `max_rows_per_query` by default so a
+    single call can't blow past the agent's context window. When a query was
+    truncated, the result includes `truncated: true` and `row_count: <total>`
+    so you know to re-call with a higher limit (or null) if you need all rows.
 
     Args:
         report_token: The report token.
         run_token: Specific run token. If omitted, uses the latest succeeded run.
+        max_rows_per_query: Max rows to return per query. Default 500. Pass null
+            to fetch every row — can be very large (hundreds of MB) for
+            dashboards with long time-series or wide cross-tabs.
     """
     mode = _mode(ctx)
     if not run_token:
@@ -619,7 +644,9 @@ async def get_run_results(
             raise ToolError("No succeeded runs found for this report.")
         run_token = succeeded[0]["token"]
 
-    return await _fetch_run_results(mode.client, report_token, run_token)
+    return await _fetch_run_results(
+        mode.client, report_token, run_token, max_rows_per_query
+    )
 
 
 
