@@ -26,9 +26,11 @@ An MCP server that lets you browse reports, manage queries, and fetch results fr
 
 ### 1. Get Mode API credentials
 
-A Workspace admin creates the token in Mode under **Workspace Settings > Privacy & Security > API**: click the gear icon, choose **Create new API token**, and save the token and secret.
+Use a **Member API key** (recommended). Create your own under **Workspace Settings > Personal > My API Keys** and save the token and secret. Member keys respect your own Mode permissions, so the agent can only see and change what you can. If you can't create one, a Workspace admin needs to enable them under **Workspace Settings > Features > API Keys > Member keys**.
 
-Mode no longer allows creating new *personal* API tokens (existing ones keep working). Workspace API tokens act with admin access to the whole Workspace, so treat them accordingly — see **Limitations / Safety** below.
+Mode also offers **Workspace API tokens**, created by admins under **Workspace Settings > Privacy & Security > API**. These act with admin access to the whole Workspace, so only use one if you need that — see **Limitations / Safety** below. (Older *personal* API tokens can no longer be created, but existing ones keep working.)
+
+Both kinds of key expire after 90 days by default. When yours expires, the server reports "Authentication failed"; create a new key and update your MCP config.
 
 ### 2. Install uv
 
@@ -72,7 +74,7 @@ Some clients expand `${VAR}`, some use another syntax (e.g. `${env:VAR}`), and s
 | Variable | Required | Description |
 |---|---|---|
 | `MODE_WORKSPACE` | Yes | Your Workspace's username, as in `app.mode.com/<workspace>/...` |
-| `MODE_API_TOKEN` | Yes | API token |
+| `MODE_API_TOKEN` | Yes | API token (from a Member API key, ideally) |
 | `MODE_API_SECRET` | Yes | API secret |
 | `MODE_ENABLE_DELETES` | No | Set to `true` to enable `delete_report` and `delete_query`. Off by default |
 | `MODE_READ_ONLY` | No | Set to `true` to disable every tool that writes to Mode (overrides `MODE_ENABLE_DELETES`) |
@@ -95,7 +97,7 @@ A misspelled tool name in `MODE_DISABLED_TOOLS` stops the server with an error r
 - Write and manage SQL queries through your agent, then run them in Mode's UI where costs and side effects are visible.
 - Use `get_run_results` to pull results from completed runs back into the conversation.
 
-**Deletes are permission-scoped, not owner-scoped.** The server does not check who created a report or query; what you can delete is whatever your API token is allowed to delete in Mode. With a personal token that's limited to your own permissions, but a Workspace API token has admin access and can delete **any** report or query in the Workspace. That's why the delete tools are off unless you set `MODE_ENABLE_DELETES=true`.
+**Deletes are permission-scoped, not owner-scoped.** The server does not check who created a report or query; what you can delete is whatever your API token is allowed to delete in Mode. With a Member API key that's limited to your own permissions, but a Workspace API token has admin access and can delete **any** report or query in the Workspace. That's why the delete tools are off unless you set `MODE_ENABLE_DELETES=true`.
 
 **Deletes can't skip the preview.** When enabled, `delete_report` and `delete_query` are always two calls:
 1. The first call deletes nothing. It returns a preview (the report's name, whether it's already archived, and its queries with who wrote each one; or a query's name, author, and SQL) plus a short `confirm_code`. Mode's API doesn't say who created a report, only who wrote each query.

@@ -5,7 +5,7 @@ Browse reports and fetch results from Mode Analytics.
 
 Env vars:
     MODE_WORKSPACE       — Mode workspace/account name
-    MODE_API_TOKEN       — API token (from Mode > Settings > API Tokens)
+    MODE_API_TOKEN       — API token (Workspace Settings > Personal > My API Keys)
     MODE_API_SECRET      — API secret
     MODE_ENABLE_DELETES  — "true" to enable delete_report and delete_query
                            (off by default)
@@ -97,7 +97,8 @@ def _check(resp: httpx.Response) -> None:
         if status == 404:
             msg = "Resource not found."
         elif status == 401:
-            msg = "Authentication failed — check MODE_API_TOKEN and MODE_API_SECRET."
+            msg = ("Authentication failed — check MODE_API_TOKEN and MODE_API_SECRET. "
+                   "Mode API keys expire after 90 days by default; create a new one if yours has expired.")
         elif status == 403:
             msg = "Permission denied — your API token may lack access to this resource."
         else:
