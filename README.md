@@ -26,11 +26,15 @@ An MCP server that lets you browse reports, manage queries, and fetch results fr
 
 ### 1. Get Mode API credentials
 
-Go to **Mode > Settings > API Tokens** and create a token/secret pair.
+A Workspace admin creates the token in Mode under **Workspace Settings > Privacy & Security > API**: click the gear icon, choose **Create new API token**, and save the token and secret.
 
-Mode no longer allows creating new *personal* API tokens (existing ones keep working). New tokens are **Workspace API tokens**, which only Workspace admins can create and which act with admin access to the whole Workspace. Treat them accordingly — see [Limitations / Safety](#limitations--safety).
+Mode no longer allows creating new *personal* API tokens (existing ones keep working). Workspace API tokens act with admin access to the whole Workspace, so treat them accordingly — see **Limitations / Safety** below.
 
-### 2. Add the server to your MCP client
+### 2. Install uv
+
+The server is launched with `uvx`, which comes with [uv](https://docs.astral.sh/uv/getting-started/installation/). Install it with `brew install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`.
+
+### 3. Add the server to your MCP client
 
 The server runs over stdio via `uvx mode-mcp`. Add it to your MCP client's config; most clients use this `mcpServers` shape:
 
@@ -50,7 +54,7 @@ The server runs over stdio via `uvx mode-mcp`. Add it to your MCP client's confi
 }
 ```
 
-`uvx` will install the package from PyPI on first run.
+`uvx` installs the package from PyPI on first run and reuses that version afterwards. To pick up new releases automatically, use `"args": ["mode-mcp@latest"]` instead.
 
 The `${MODE_API_TOKEN}` / `${MODE_API_SECRET}` references are expanded from your shell environment by clients that support it, so no secrets land in the config file. Set them wherever you keep shell secrets, e.g. in `~/.zshrc`:
 
@@ -67,7 +71,7 @@ Some clients expand `${VAR}`, some use another syntax (e.g. `${env:VAR}`), and s
 
 | Variable | Required | Description |
 |---|---|---|
-| `MODE_WORKSPACE` | Yes | Mode workspace/account name |
+| `MODE_WORKSPACE` | Yes | Your Workspace's username, as in `app.mode.com/<workspace>/...` |
 | `MODE_API_TOKEN` | Yes | API token |
 | `MODE_API_SECRET` | Yes | API secret |
 | `MODE_ENABLE_DELETES` | No | Set to `true` to enable `delete_report` and `delete_query`. Off by default |
@@ -103,7 +107,7 @@ A misspelled tool name in `MODE_DISABLED_TOOLS` stops the server with an error r
 
 ## Development
 
-The source repo is private; the package is published to PyPI.
+For maintainers (the source repo is private):
 
 ```bash
 git clone git@github.com:nataliemona/mode_mcp.git
