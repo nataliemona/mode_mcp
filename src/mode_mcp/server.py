@@ -346,11 +346,21 @@ async def create_report(
     report_token = resp.json()["token"]
 
     # Mode's create endpoint ignores name and description; set them with a PATCH.
-    resp = await mode.client.patch(
-        f"/reports/{report_token}",
-        json={"report": {"name": name, "description": description}},
-    )
-    _check(resp)
+    # The report already exists at this point, so a failure here must say which
+    # report was left untitled — otherwise it's orphaned with no way to find it.
+    try:
+        resp = await mode.client.patch(
+            f"/reports/{report_token}",
+            json={"report": {"name": name, "description": description}},
+        )
+        _check(resp)
+    except (ToolError, httpx.HTTPError) as exc:
+        raise ToolError(
+            f"Created report {report_token} but failed to set its name and "
+            f"description ({exc}). It exists untitled at "
+            f"https://app.mode.com/{mode.workspace}/reports/{report_token} — retry "
+            f"with update_report(report_token={report_token!r}, ...) or archive it."
+        ) from exc
     report = resp.json()
 
     async def _add_one(q: dict[str, Any]) -> dict[str, Any]:

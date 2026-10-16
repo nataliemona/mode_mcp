@@ -433,6 +433,28 @@ async def test_create_report_with_queries():
 
 @pytest.mark.asyncio
 @respx.mock
+@pytest.mark.parametrize(
+    "patch_mock",
+    [
+        {"return_value": httpx.Response(403, json={"error": "forbidden"})},
+        {"side_effect": httpx.ConnectError("connection reset")},
+    ],
+    ids=["http-error", "network-error"],
+)
+async def test_create_report_rename_failure_names_orphan(patch_mock):
+    respx.post(f"{BASE}/reports").mock(
+        return_value=httpx.Response(200, json={"token": "rpt_new", "name": None})
+    )
+    respx.patch(f"{BASE}/reports/rpt_new").mock(**patch_mock)
+
+    async with _test_client() as client:
+        with pytest.raises(ToolError, match="Created report rpt_new") as exc_info:
+            await server.create_report(_mock_ctx(client), "sp1", "New Report", "")
+    assert f"https://app.mode.com/{WORKSPACE}/reports/rpt_new" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_create_report_partial_query_failure():
     respx.post(f"{BASE}/reports").mock(
         return_value=httpx.Response(200, json={"token": "rpt_new", "name": None})
