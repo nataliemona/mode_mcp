@@ -107,10 +107,8 @@ A misspelled tool name in `MODE_DISABLED_TOOLS` stops the server with an error r
 
 ## Development
 
-For maintainers (the source repo is private):
-
 ```bash
-git clone git@github.com:nataliemona/mode_mcp.git
+git clone https://github.com/nataliemona/mode_mcp.git
 cd mode_mcp
 uv sync --dev
 uv run pytest
