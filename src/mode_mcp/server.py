@@ -7,17 +7,25 @@ Env vars:
     MODE_WORKSPACE       — Mode workspace/account name
     MODE_API_TOKEN       — API token (from Mode > Settings > API Tokens)
     MODE_API_SECRET      — API secret
+    MODE_ENABLE_DELETES  — "true" to enable delete_report and delete_query
+                           (off by default)
+    MODE_READ_ONLY       — "true" to disable every tool that writes to Mode
+    MODE_DISABLED_TOOLS  — comma-separated tool names to disable, e.g.
+                           "delete_report,delete_query"
 """
 
 import asyncio
+import hashlib
+import json
 import os
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 MODE_API_BASE = "https://app.mode.com/api"
 
@@ -38,11 +46,21 @@ def _get_config() -> tuple[str, str, str]:
         raise ValueError(
             "Set MODE_WORKSPACE, MODE_API_TOKEN, and MODE_API_SECRET env vars"
         )
+    for name, value in [
+        ("MODE_WORKSPACE", workspace),
+        ("MODE_API_TOKEN", token),
+        ("MODE_API_SECRET", secret),
+    ]:
+        if value.startswith("${"):
+            raise ValueError(
+                f"{name} is the literal text {value!r}. Your MCP client didn't expand "
+                f"the variable reference; check its docs for env var syntax or set the value directly."
+            )
     return workspace, token, secret
 
 
 @asynccontextmanager
-async def lifespan(server: FastMCP):
+async def lifespan(server: MCPServer):
     """Create a shared httpx client for the lifetime of the server."""
     workspace, token, secret = _get_config()
     async with httpx.AsyncClient(
@@ -57,7 +75,7 @@ async def lifespan(server: FastMCP):
         yield ModeContext(client=client, workspace=workspace)
 
 
-mcp = FastMCP("mode-analytics", lifespan=lifespan)
+mcp = MCPServer("mode-analytics", lifespan=lifespan)
 
 
 def _mode(ctx: Context) -> ModeContext:
@@ -409,39 +427,94 @@ async def update_report(
     }
 
 
+def _confirm_code(*parts: Any) -> str:
+    """Short fingerprint of what a delete preview showed.
+
+    Deletes only proceed when the caller passes back the code from a preview,
+    so the preview can't be skipped, and a resource that changed since the
+    preview (renamed, SQL edited, queries added) won't be deleted by mistake.
+    """
+    blob = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:8]
+
+
+def _verify_confirm_code(given: str, expected: str, tool: str) -> None:
+    if given.strip().lower() != expected:
+        raise ToolError(
+            f"confirm_code does not match. The resource may have changed since the "
+            f"preview, or the code is wrong. Call {tool} again without confirm_code "
+            f"to get a fresh preview, show it to the user, and only then delete."
+        )
+
+
 @mcp.tool()
 async def delete_query(
-    ctx: Context, report_token: str, query_token: str
+    ctx: Context,
+    report_token: str,
+    query_token: str,
+    confirm_code: str | None = None,
 ) -> dict[str, Any]:
-    """Delete a query from a report. Only deletes queries you created.
+    """Permanently delete a query from a report. This cannot be undone.
 
-    This is a destructive operation — the query will be permanently removed.
+    Two steps, always:
+    1. Call without confirm_code. Returns a preview (query name and SQL) and a
+       confirm_code. Nothing is deleted.
+    2. Show the preview to the user and get their explicit approval. Only then
+       call again with the confirm_code from step 1.
 
     Args:
         report_token: The report containing the query.
         query_token: The query to delete (use get_report to find query tokens).
+        confirm_code: The code returned by the preview call. Never guess it.
     """
     mode = _mode(ctx)
+    resp = await mode.client.get(f"/reports/{report_token}/queries/{query_token}")
+    _check(resp)
+    q = resp.json()
+    code = _confirm_code(
+        query_token, q.get("name"), q.get("raw_query"), q.get("updated_at")
+    )
+
+    if confirm_code is None:
+        return {
+            "confirm_required": True,
+            "report_token": report_token,
+            "query_token": query_token,
+            "name": q.get("name", ""),
+            "raw_query": q.get("raw_query", ""),
+            "confirm_code": code,
+            "message": (
+                "Nothing was deleted. Show this to the user; if they approve, "
+                "call delete_query again with this confirm_code."
+            ),
+        }
+
+    _verify_confirm_code(confirm_code, code, "delete_query")
     resp = await mode.client.delete(
         f"/reports/{report_token}/queries/{query_token}"
     )
     _check(resp)
-    return {"deleted": True, "query_token": query_token}
+    return {"deleted": True, "query_token": query_token, "name": q.get("name", "")}
 
 
 @mcp.tool()
 async def delete_report(
-    ctx: Context, report_token: str, confirm: bool = False
+    ctx: Context, report_token: str, confirm_code: str | None = None
 ) -> dict[str, Any]:
-    """Delete a report. Only deletes reports you created.
+    """Permanently delete a report and all its queries. This cannot be undone.
 
-    This is a destructive operation. Call first without confirm to preview
-    what will be deleted. Then call again with confirm=True to proceed.
+    Prefer archive_report unless the user explicitly wants a permanent delete —
+    archiving hides the report but can be reversed with unarchive_report.
+
+    Two steps, always:
+    1. Call without confirm_code. Returns a preview (name, creator, queries) and
+       a confirm_code. Nothing is deleted.
+    2. Show the preview to the user and get their explicit approval. Only then
+       call again with the confirm_code from step 1.
 
     Args:
         report_token: The report to delete (use list_reports to find tokens).
-        confirm: Must be True to actually delete. Without it, returns report
-            details for review.
+        confirm_code: The code returned by the preview call. Never guess it.
     """
     mode = _mode(ctx)
     report_resp, queries_resp = await asyncio.gather(
@@ -458,8 +531,14 @@ async def delete_report(
     queries = _embedded(queries_resp.json(), "queries")
     # Extract creator username from href like "/api/username/reports/..."
     creator = creator_href.split("/")[2] if creator_href.count("/") >= 2 else "unknown"
+    code = _confirm_code(
+        report_token,
+        report.get("name"),
+        report.get("updated_at"),
+        sorted((q.get("token"), q.get("raw_query")) for q in queries),
+    )
 
-    if not confirm:
+    if confirm_code is None:
         return {
             "confirm_required": True,
             "report_token": report_token,
@@ -467,12 +546,57 @@ async def delete_report(
             "creator": creator,
             "query_count": len(queries),
             "queries": [q.get("name", "") for q in queries],
-            "message": "Call again with confirm=True to delete this report.",
+            "url": f"https://app.mode.com/{mode.workspace}/reports/{report_token}",
+            "confirm_code": code,
+            "message": (
+                "Nothing was deleted. Show this to the user and suggest "
+                "archive_report as a reversible alternative; if they still want "
+                "a permanent delete, call delete_report again with this confirm_code."
+            ),
         }
 
+    _verify_confirm_code(confirm_code, code, "delete_report")
     resp = await mode.client.delete(f"/reports/{report_token}")
     _check(resp)
     return {"deleted": True, "report_token": report_token, "name": report.get("name")}
+
+
+@mcp.tool()
+async def archive_report(ctx: Context, report_token: str) -> dict[str, Any]:
+    """Archive a report, hiding it from view. Reversible with unarchive_report.
+
+    This is the safe alternative to delete_report.
+
+    Args:
+        report_token: The report to archive.
+    """
+    mode = _mode(ctx)
+    resp = await mode.client.patch(f"/reports/{report_token}/archive")
+    _check(resp)
+    report = resp.json()
+    return {
+        "archived": True,
+        "report_token": report_token,
+        "name": report.get("name"),
+    }
+
+
+@mcp.tool()
+async def unarchive_report(ctx: Context, report_token: str) -> dict[str, Any]:
+    """Restore an archived report.
+
+    Args:
+        report_token: The report to unarchive.
+    """
+    mode = _mode(ctx)
+    resp = await mode.client.patch(f"/reports/{report_token}/unarchive")
+    _check(resp)
+    report = resp.json()
+    return {
+        "archived": False,
+        "report_token": report_token,
+        "name": report.get("name"),
+    }
 
 
 @mcp.tool()
@@ -650,7 +774,45 @@ async def get_run_results(
 
 
 
+WRITE_TOOLS = frozenset({
+    "create_report",
+    "update_report",
+    "archive_report",
+    "unarchive_report",
+    "add_query",
+    "update_query",
+    "delete_query",
+    "delete_report",
+})
+
+DELETE_TOOLS = frozenset({"delete_query", "delete_report"})
+
+
+def _env_flag(env: Mapping[str, str], name: str) -> bool:
+    return env.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _disabled_tools(env: Mapping[str, str], all_tools: set[str]) -> set[str]:
+    """Work out which tools to disable from the MODE_* tool settings."""
+    disabled: set[str] = set()
+    if not _env_flag(env, "MODE_ENABLE_DELETES"):
+        disabled |= DELETE_TOOLS
+    if _env_flag(env, "MODE_READ_ONLY"):
+        disabled |= WRITE_TOOLS
+    names = {n.strip() for n in env.get("MODE_DISABLED_TOOLS", "").split(",") if n.strip()}
+    unknown = names - all_tools
+    if unknown:
+        raise ValueError(
+            f"MODE_DISABLED_TOOLS has unknown tool(s): {', '.join(sorted(unknown))}. "
+            f"Valid tools: {', '.join(sorted(all_tools))}"
+        )
+    return disabled | names
+
+
 def main() -> None:
+    all_tools = {t.name for t in asyncio.run(mcp.list_tools())}
+    for name in _disabled_tools(os.environ, all_tools):
+        mcp.remove_tool(name)
     mcp.run()
 
 

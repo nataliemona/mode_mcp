@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 import respx
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError
 
 from mode_mcp import server
 
@@ -57,6 +57,12 @@ def _hal(key, items):
 def test_get_config_missing(monkeypatch):
     monkeypatch.delenv("MODE_WORKSPACE", raising=False)
     with pytest.raises(ValueError, match="MODE_WORKSPACE"):
+        server._get_config()
+
+
+def test_get_config_unexpanded_reference(monkeypatch):
+    monkeypatch.setenv("MODE_API_TOKEN", "${MODE_API_TOKEN}")
+    with pytest.raises(ValueError, match="didn't expand"):
         server._get_config()
 
 
@@ -486,7 +492,7 @@ async def test_update_report_nothing():
 
 
 # ---------------------------------------------------------------------------
-# delete_report — own report
+# delete_report
 # ---------------------------------------------------------------------------
 
 
@@ -519,6 +525,7 @@ def _mock_report_for_delete(owner="testuser"):
 @respx.mock
 async def test_delete_report_preview():
     _mock_report_for_delete()
+    delete_route = respx.delete(f"{BASE}/reports/rpt1")
 
     async with _test_client() as client:
         result = await server.delete_report(_mock_ctx(client), "rpt1")
@@ -527,6 +534,8 @@ async def test_delete_report_preview():
     assert result["creator"] == "testuser"
     assert result["query_count"] == 2
     assert result["queries"] == ["revenue", "users"]
+    assert len(result["confirm_code"]) == 8
+    assert not delete_route.called
 
 
 @pytest.mark.asyncio
@@ -538,29 +547,167 @@ async def test_delete_report_confirmed():
     )
 
     async with _test_client() as client:
-        result = await server.delete_report(_mock_ctx(client), "rpt1", confirm=True)
+        preview = await server.delete_report(_mock_ctx(client), "rpt1")
+        result = await server.delete_report(
+            _mock_ctx(client), "rpt1", confirm_code=preview["confirm_code"]
+        )
     assert result["deleted"] is True
     assert result["name"] == "My Report"
     assert delete_route.called
 
 
-# ---------------------------------------------------------------------------
-# delete_query — own query
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+@respx.mock
+async def test_delete_report_wrong_code():
+    _mock_report_for_delete()
+    delete_route = respx.delete(f"{BASE}/reports/rpt1")
+
+    async with _test_client() as client:
+        with pytest.raises(ToolError, match="confirm_code does not match"):
+            await server.delete_report(_mock_ctx(client), "rpt1", confirm_code="deadbeef")
+    assert not delete_route.called
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_delete_query():
+async def test_delete_report_changed_since_preview():
+    _mock_report_for_delete()
+    delete_route = respx.delete(f"{BASE}/reports/rpt1")
+
+    async with _test_client() as client:
+        preview = await server.delete_report(_mock_ctx(client), "rpt1")
+        # Someone edits a query between preview and delete.
+        respx.get(f"{BASE}/reports/rpt1/queries").mock(
+            return_value=httpx.Response(
+                200,
+                json=_hal("queries", [
+                    {"token": "q1", "name": "revenue", "raw_query": "SELECT 2"},
+                    {"token": "q2", "name": "users"},
+                ]),
+            )
+        )
+        with pytest.raises(ToolError, match="confirm_code does not match"):
+            await server.delete_report(
+                _mock_ctx(client), "rpt1", confirm_code=preview["confirm_code"]
+            )
+    assert not delete_route.called
+
+
+# ---------------------------------------------------------------------------
+# delete_query
+# ---------------------------------------------------------------------------
+
+
+def _mock_query_for_delete():
+    respx.get(f"{BASE}/reports/rpt1/queries/q1").mock(
+        return_value=httpx.Response(
+            200,
+            json={"token": "q1", "name": "revenue", "raw_query": "SELECT 1"},
+        )
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_delete_query_preview():
+    _mock_query_for_delete()
+    delete_route = respx.delete(f"{BASE}/reports/rpt1/queries/q1")
+
+    async with _test_client() as client:
+        result = await server.delete_query(_mock_ctx(client), "rpt1", "q1")
+    assert result["confirm_required"] is True
+    assert result["name"] == "revenue"
+    assert result["raw_query"] == "SELECT 1"
+    assert not delete_route.called
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_delete_query_confirmed():
+    _mock_query_for_delete()
     delete_route = respx.delete(f"{BASE}/reports/rpt1/queries/q1").mock(
         return_value=httpx.Response(204)
     )
 
     async with _test_client() as client:
-        result = await server.delete_query(_mock_ctx(client), "rpt1", "q1")
+        preview = await server.delete_query(_mock_ctx(client), "rpt1", "q1")
+        result = await server.delete_query(
+            _mock_ctx(client), "rpt1", "q1", confirm_code=preview["confirm_code"]
+        )
     assert result["deleted"] is True
     assert result["query_token"] == "q1"
     assert delete_route.called
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_delete_query_wrong_code():
+    _mock_query_for_delete()
+    delete_route = respx.delete(f"{BASE}/reports/rpt1/queries/q1")
+
+    async with _test_client() as client:
+        with pytest.raises(ToolError, match="confirm_code does not match"):
+            await server.delete_query(_mock_ctx(client), "rpt1", "q1", confirm_code="nope")
+    assert not delete_route.called
+
+
+# ---------------------------------------------------------------------------
+# archive / unarchive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_archive_and_unarchive_report():
+    archive = respx.patch(f"{BASE}/reports/rpt1/archive").mock(
+        return_value=httpx.Response(200, json={"token": "rpt1", "name": "My Report"})
+    )
+    unarchive = respx.patch(f"{BASE}/reports/rpt1/unarchive").mock(
+        return_value=httpx.Response(200, json={"token": "rpt1", "name": "My Report"})
+    )
+
+    async with _test_client() as client:
+        result = await server.archive_report(_mock_ctx(client), "rpt1")
+        assert result == {"archived": True, "report_token": "rpt1", "name": "My Report"}
+        result = await server.unarchive_report(_mock_ctx(client), "rpt1")
+        assert result["archived"] is False
+    assert archive.called and unarchive.called
+
+
+# ---------------------------------------------------------------------------
+# Tool enable/disable config
+# ---------------------------------------------------------------------------
+
+ALL_TOOLS = {"list_spaces", "get_report", *server.WRITE_TOOLS}
+
+
+def test_disabled_tools_deletes_off_by_default():
+    assert server._disabled_tools({}, ALL_TOOLS) == server.DELETE_TOOLS
+
+
+def test_disabled_tools_enable_deletes():
+    assert server._disabled_tools({"MODE_ENABLE_DELETES": "true"}, ALL_TOOLS) == set()
+
+
+def test_disabled_tools_read_only_wins_over_enable_deletes():
+    env = {"MODE_READ_ONLY": "true", "MODE_ENABLE_DELETES": "true"}
+    assert server._disabled_tools(env, ALL_TOOLS) == server.WRITE_TOOLS
+
+
+def test_disabled_tools_list():
+    env = {"MODE_ENABLE_DELETES": "true", "MODE_DISABLED_TOOLS": " create_report, add_query ,"}
+    assert server._disabled_tools(env, ALL_TOOLS) == {"create_report", "add_query"}
+
+
+def test_disabled_tools_unknown_name():
+    with pytest.raises(ValueError, match="delete_reports"):
+        server._disabled_tools({"MODE_DISABLED_TOOLS": "delete_reports"}, ALL_TOOLS)
+
+
+def test_write_tools_are_registered():
+    import asyncio
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    assert server.WRITE_TOOLS <= names
 
 
 # ---------------------------------------------------------------------------
