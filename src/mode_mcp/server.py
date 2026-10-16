@@ -339,12 +339,19 @@ async def create_report(
     """
     mode = _mode(ctx)
     resp = await mode.client.post(
-        f"/spaces/{space_token}/reports",
+        "/reports",
+        json={"report": {"space_token": space_token}},
+    )
+    _check(resp)
+    report_token = resp.json()["token"]
+
+    # Mode's create endpoint ignores name and description; set them with a PATCH.
+    resp = await mode.client.patch(
+        f"/reports/{report_token}",
         json={"report": {"name": name, "description": description}},
     )
     _check(resp)
     report = resp.json()
-    report_token = report["token"]
 
     async def _add_one(q: dict[str, Any]) -> dict[str, Any]:
         q_resp = await mode.client.post(

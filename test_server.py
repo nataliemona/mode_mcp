@@ -1,5 +1,6 @@
 """Tests for the Mode Analytics MCP server."""
 
+import json
 from unittest.mock import MagicMock
 
 import httpx
@@ -366,7 +367,10 @@ async def test_list_report_runs():
 @pytest.mark.asyncio
 @respx.mock
 async def test_create_report_no_queries():
-    respx.post(f"{BASE}/spaces/sp1/reports").mock(
+    respx.post(f"{BASE}/reports").mock(
+        return_value=httpx.Response(200, json={"token": "rpt_new", "name": None})
+    )
+    respx.patch(f"{BASE}/reports/rpt_new").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -379,6 +383,7 @@ async def test_create_report_no_queries():
 
     async with _test_client() as client:
         result = await server.create_report(_mock_ctx(client), "sp1", "New Report", "A test report")
+    assert json.loads(respx.calls[0].request.content) == {"report": {"space_token": "sp1"}}
     assert result["token"] == "rpt_new"
     assert result["name"] == "New Report"
     assert result["queries_added"] == 0
@@ -393,7 +398,10 @@ async def test_create_report_no_queries():
 @pytest.mark.asyncio
 @respx.mock
 async def test_create_report_with_queries():
-    respx.post(f"{BASE}/spaces/sp1/reports").mock(
+    respx.post(f"{BASE}/reports").mock(
+        return_value=httpx.Response(200, json={"token": "rpt_new", "name": None})
+    )
+    respx.patch(f"{BASE}/reports/rpt_new").mock(
         return_value=httpx.Response(
             200,
             json={"token": "rpt_new", "name": "With Queries", "description": ""},
@@ -426,7 +434,10 @@ async def test_create_report_with_queries():
 @pytest.mark.asyncio
 @respx.mock
 async def test_create_report_partial_query_failure():
-    respx.post(f"{BASE}/spaces/sp1/reports").mock(
+    respx.post(f"{BASE}/reports").mock(
+        return_value=httpx.Response(200, json={"token": "rpt_new", "name": None})
+    )
+    respx.patch(f"{BASE}/reports/rpt_new").mock(
         return_value=httpx.Response(
             200,
             json={"token": "rpt_new", "name": "Partial", "description": ""},
