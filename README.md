@@ -8,9 +8,9 @@ An MCP server that lets you browse reports, manage queries, and fetch results fr
 |---|---|
 | `list_data_sources` | List all database connections in the workspace |
 | `list_spaces` | List all spaces (collections) |
-| `list_reports` | List reports in a given space |
-| `search_reports` | Search for reports by name or description across all spaces (client-side) |
-| `get_report` | Get report details including its SQL queries |
+| `list_reports` | List reports in a given space (archived ones hidden unless `include_archived=true`) |
+| `search_reports` | Search for reports by name or description across all spaces (client-side; archived ones hidden unless `include_archived=true`) |
+| `get_report` | Get report details including its SQL queries and who wrote each one |
 | `list_report_runs` | List recent runs for a report (state, timestamps) |
 | `get_run_results` | Fetch results from a specific or latest report run |
 | `create_report` | Create a new report in a space, optionally with initial queries |
@@ -98,7 +98,7 @@ A misspelled tool name in `MODE_DISABLED_TOOLS` stops the server with an error r
 **Deletes are permission-scoped, not owner-scoped.** The server does not check who created a report or query; what you can delete is whatever your API token is allowed to delete in Mode. With a personal token that's limited to your own permissions, but a Workspace API token has admin access and can delete **any** report or query in the Workspace. That's why the delete tools are off unless you set `MODE_ENABLE_DELETES=true`.
 
 **Deletes can't skip the preview.** When enabled, `delete_report` and `delete_query` are always two calls:
-1. The first call deletes nothing. It returns a preview (report name, creator and queries, or the query's name and SQL) plus a short `confirm_code`.
+1. The first call deletes nothing. It returns a preview (the report's name, whether it's already archived, and its queries with who wrote each one; or a query's name, author, and SQL) plus a short `confirm_code`. Mode's API doesn't say who created a report, only who wrote each query.
 2. The delete only happens when the same tool is called again with that `confirm_code`. The code is a fingerprint of what the preview showed, so it can't be guessed, and if the report or query changed after the preview (renamed, SQL edited, queries added), the code no longer matches and the delete is refused.
 
 **Archive instead of delete.** `archive_report` hides a report and `unarchive_report` brings it back. The delete tool tells the agent to suggest archiving first.

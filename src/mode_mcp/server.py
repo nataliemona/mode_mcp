@@ -112,6 +112,16 @@ def _embedded(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
     return data.get("_embedded", {}).get(key, [])
 
 
+def _creator(obj: dict[str, Any]) -> str | None:
+    """Mode username from an object's creator link, e.g. "/api/jane_doe" -> "jane_doe".
+
+    Mode includes this on queries but not on reports.
+    """
+    href = obj.get("_links", {}).get("creator", {}).get("href", "")
+    parts = [p for p in href.split("/") if p]
+    return parts[1] if len(parts) >= 2 and parts[0] == "api" else None
+
+
 
 # ---------------------------------------------------------------------------
 # Browsing tools
@@ -165,13 +175,14 @@ async def list_spaces(ctx: Context, limit: int = 50) -> list[dict[str, Any]]:
 
 @mcp.tool()
 async def list_reports(
-    ctx: Context, space_token: str, limit: int = 50
+    ctx: Context, space_token: str, limit: int = 50, include_archived: bool = False
 ) -> list[dict[str, Any]]:
-    """List reports in a space.
+    """List reports in a space. Archived reports are hidden unless include_archived.
 
     Args:
         space_token: Space token (use list_spaces to find it).
         limit: Max number of results to return (default 50).
+        include_archived: Also return archived reports (each has an `archived` flag).
     """
     mode = _mode(ctx)
     resp = await mode.client.get(
@@ -179,11 +190,14 @@ async def list_reports(
     )
     _check(resp)
     reports = _embedded(resp.json(), "reports")
+    if not include_archived:
+        reports = [r for r in reports if not r.get("archived")]
     return [
         {
             "token": r["token"],
             "name": r["name"],
             "description": r.get("description", ""),
+            "archived": bool(r.get("archived")),
             "created_at": r.get("created_at"),
             "last_run_at": r.get("last_run_at"),
         }
@@ -193,17 +207,19 @@ async def list_reports(
 
 @mcp.tool()
 async def search_reports(
-    ctx: Context, query: str, limit: int = 50
+    ctx: Context, query: str, limit: int = 50, include_archived: bool = False
 ) -> list[dict[str, Any]]:
     """Search for reports by name or description across all spaces.
 
     Mode's REST API has no native report-search endpoint, so this fans out
     across every space and filters client-side (case-insensitive substring
     match on name and description). May be slow on large workspaces.
+    Archived reports are skipped unless include_archived.
 
     Args:
         query: Search term to match against report names and descriptions.
         limit: Max number of results to return (default 50).
+        include_archived: Also return archived reports (each has an `archived` flag).
     """
     mode = _mode(ctx)
     q = query.lower()
@@ -227,6 +243,8 @@ async def search_reports(
     matches: list[dict[str, Any]] = []
     for space, reports in groups:
         for r in reports:
+            if r.get("archived") and not include_archived:
+                continue
             name = (r.get("name") or "").lower()
             desc = (r.get("description") or "").lower()
             if q in name or q in desc:
@@ -237,6 +255,7 @@ async def search_reports(
                         "description": r.get("description", ""),
                         "space_token": space["token"],
                         "space_name": space.get("name", ""),
+                        "archived": bool(r.get("archived")),
                         "created_at": r.get("created_at"),
                         "last_run_at": r.get("last_run_at"),
                     }
@@ -267,12 +286,14 @@ async def get_report(ctx: Context, report_token: str) -> dict[str, Any]:
         "token": report["token"],
         "name": report.get("name"),
         "description": report.get("description", ""),
+        "archived": bool(report.get("archived")),
         "created_at": report.get("created_at"),
         "last_run_at": report.get("last_run_at"),
         "queries": [
             {
                 "token": q["token"],
                 "name": q.get("name", ""),
+                "creator": _creator(q),
                 "raw_query": q.get("raw_query", ""),
                 "data_source_id": q.get("data_source_id"),
             }
@@ -474,7 +495,7 @@ async def delete_query(
     """Permanently delete a query from a report. This cannot be undone.
 
     Two steps, always:
-    1. Call without confirm_code. Returns a preview (query name and SQL) and a
+    1. Call without confirm_code. Returns a preview (query name, author, SQL) and a
        confirm_code. Nothing is deleted.
     2. Show the preview to the user and get their explicit approval. Only then
        call again with the confirm_code from step 1.
@@ -498,6 +519,7 @@ async def delete_query(
             "report_token": report_token,
             "query_token": query_token,
             "name": q.get("name", ""),
+            "creator": _creator(q),
             "raw_query": q.get("raw_query", ""),
             "confirm_code": code,
             "message": (
@@ -524,7 +546,8 @@ async def delete_report(
     archiving hides the report but can be reversed with unarchive_report.
 
     Two steps, always:
-    1. Call without confirm_code. Returns a preview (name, creator, queries) and
+    1. Call without confirm_code. Returns a preview (name, queries and who wrote
+       them, whether it's already archived) and
        a confirm_code. Nothing is deleted.
     2. Show the preview to the user and get their explicit approval. Only then
        call again with the confirm_code from step 1.
@@ -542,12 +565,7 @@ async def delete_report(
     _check(queries_resp)
 
     report = report_resp.json()
-    creator_href = (
-        report.get("_links", {}).get("creator", {}).get("href", "")
-    )
     queries = _embedded(queries_resp.json(), "queries")
-    # Extract creator username from href like "/api/username/reports/..."
-    creator = creator_href.split("/")[2] if creator_href.count("/") >= 2 else "unknown"
     code = _confirm_code(
         report_token,
         report.get("name"),
@@ -560,9 +578,12 @@ async def delete_report(
             "confirm_required": True,
             "report_token": report_token,
             "name": report.get("name"),
-            "creator": creator,
+            "archived": bool(report.get("archived")),
             "query_count": len(queries),
-            "queries": [q.get("name", "") for q in queries],
+            # Mode doesn't expose a report's creator, only each query's.
+            "queries": [
+                {"name": q.get("name", ""), "creator": _creator(q)} for q in queries
+            ],
             "url": f"https://app.mode.com/{mode.workspace}/reports/{report_token}",
             "confirm_code": code,
             "message": (

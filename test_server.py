@@ -173,6 +173,70 @@ async def test_list_reports():
         result = await server.list_reports(_mock_ctx(client), "sp1")
     assert result[0]["token"] == "rpt1"
     assert result[0]["name"] == "Daily Metrics"
+    assert result[0]["archived"] is False
+
+
+def _mock_space_with_archived():
+    respx.get(f"{BASE}/spaces/sp1/reports").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal("reports", [
+                {"token": "live", "name": "Live metrics", "archived": False},
+                {"token": "old", "name": "Old metrics", "archived": True},
+            ]),
+        )
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_reports_hides_archived_by_default():
+    _mock_space_with_archived()
+
+    async with _test_client() as client:
+        result = await server.list_reports(_mock_ctx(client), "sp1")
+    assert [r["token"] for r in result] == ["live"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_reports_include_archived():
+    _mock_space_with_archived()
+
+    async with _test_client() as client:
+        result = await server.list_reports(_mock_ctx(client), "sp1", include_archived=True)
+    assert {r["token"]: r["archived"] for r in result} == {"live": False, "old": True}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_search_reports_hides_archived_by_default():
+    respx.get(f"{BASE}/spaces").mock(
+        return_value=httpx.Response(200, json=_hal("spaces", [{"token": "sp1", "name": "Eng"}]))
+    )
+    _mock_space_with_archived()
+
+    async with _test_client() as client:
+        default = await server.search_reports(_mock_ctx(client), "metrics")
+        everything = await server.search_reports(
+            _mock_ctx(client), "metrics", include_archived=True
+        )
+    assert [r["token"] for r in default] == ["live"]
+    assert {r["token"]: r["archived"] for r in everything} == {"live": False, "old": True}
+
+
+@pytest.mark.parametrize(
+    "obj, expected",
+    [
+        ({"_links": {"creator": {"href": "/api/jane_doe"}}}, "jane_doe"),
+        ({"_links": {"creator": {"href": "/api/jane_doe/"}}}, "jane_doe"),
+        ({"_links": {}}, None),
+        ({}, None),
+        ({"_links": {"creator": {"href": "weird"}}}, None),
+    ],
+)
+def test_creator(obj, expected):
+    assert server._creator(obj) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -529,26 +593,23 @@ async def test_update_report_nothing():
 # ---------------------------------------------------------------------------
 
 
-def _mock_report_for_delete(owner="testuser"):
-    """Set up respx mocks for delete_report tests."""
+def _mock_report_for_delete():
+    """Set up respx mocks for delete_report tests.
+
+    Matches Mode's real responses: reports carry no creator link, queries do.
+    """
     respx.get(f"{BASE}/reports/rpt1").mock(
         return_value=httpx.Response(
             200,
-            json={
-                "token": "rpt1",
-                "name": "My Report",
-                "_links": {
-                    "creator": {"href": f"/api/{owner}/reports/rpt1"}
-                },
-            },
+            json={"token": "rpt1", "name": "My Report", "archived": False},
         )
     )
     respx.get(f"{BASE}/reports/rpt1/queries").mock(
         return_value=httpx.Response(
             200,
             json=_hal("queries", [
-                {"token": "q1", "name": "revenue"},
-                {"token": "q2", "name": "users"},
+                {"token": "q1", "name": "revenue", "_links": {"creator": {"href": "/api/alice"}}},
+                {"token": "q2", "name": "users", "_links": {"creator": {"href": "/api/bob"}}},
             ]),
         )
     )
@@ -564,9 +625,13 @@ async def test_delete_report_preview():
         result = await server.delete_report(_mock_ctx(client), "rpt1")
     assert result["confirm_required"] is True
     assert result["name"] == "My Report"
-    assert result["creator"] == "testuser"
+    assert result["archived"] is False
+    assert "creator" not in result
     assert result["query_count"] == 2
-    assert result["queries"] == ["revenue", "users"]
+    assert result["queries"] == [
+        {"name": "revenue", "creator": "alice"},
+        {"name": "users", "creator": "bob"},
+    ]
     assert len(result["confirm_code"]) == 8
     assert not delete_route.called
 
@@ -635,7 +700,12 @@ def _mock_query_for_delete():
     respx.get(f"{BASE}/reports/rpt1/queries/q1").mock(
         return_value=httpx.Response(
             200,
-            json={"token": "q1", "name": "revenue", "raw_query": "SELECT 1"},
+            json={
+                "token": "q1",
+                "name": "revenue",
+                "raw_query": "SELECT 1",
+                "_links": {"creator": {"href": "/api/alice"}},
+            },
         )
     )
 
@@ -651,6 +721,7 @@ async def test_delete_query_preview():
     assert result["confirm_required"] is True
     assert result["name"] == "revenue"
     assert result["raw_query"] == "SELECT 1"
+    assert result["creator"] == "alice"
     assert not delete_route.called
 
 
