@@ -10,9 +10,14 @@ An MCP server that lets you browse reports, manage queries, and fetch results fr
 | `list_spaces` | List all spaces (collections) |
 | `list_reports` | List reports in a given space (archived ones hidden unless `include_archived=true`) |
 | `search_reports` | Search for reports by name or description across all spaces (client-side; archived ones hidden unless `include_archived=true`) |
-| `get_report` | Get report details including its SQL queries and who wrote each one |
+| `get_report` | Get report details including its SQL queries, who wrote each one, each query's charts, and the report's registered form `parameters` |
 | `list_report_runs` | List recent runs for a report (state, timestamps) |
-| `get_run_results` | Fetch results from a specific or latest report run |
+| `get_run_results` | Fetch results from a specific or latest report run. Failed queries return their warehouse error and `query_token`; pass `include_failed=true` to read the latest run even if it failed. `columns` returns only the named columns |
+| `run_report` | Run a report and return per-query results or errors. Runs **every** query in the report (warehouse cost). Reports `applied_parameters` and warns when parameters were probably ignored. Off with `MODE_READ_ONLY` |
+| `list_charts` | List the charts in a report (or on one query): token, type, title |
+| `get_chart` | Get one chart's type, title and what it plots; `include_vegas=true` adds the raw settings |
+| `create_chart` | Add a line, bar, area, pie, table or big-number chart to a query. **Undocumented endpoint** |
+| `update_chart` | Change a chart's type, columns, title or raw settings, keeping the rest of its formatting. **Undocumented endpoint** |
 | `create_report` | Create a new report in a space, optionally with initial queries |
 | `update_report` | Update a report's name, description, or move it to a different space |
 | `archive_report` | Archive (hide) a report — reversible |
@@ -84,18 +89,32 @@ Some clients expand `${VAR}`, some use another syntax (e.g. `${env:VAR}`), and s
 
 Disabled tools are never registered, so the agent doesn't see them at all.
 
-- **Default:** everything except the two delete tools. The agent can browse, author, and archive, but can't permanently delete anything.
+- **Default:** everything except the two delete tools. The agent can browse, author, run, chart, and archive, but can't permanently delete anything.
 - **Allow deletes:** add `"MODE_ENABLE_DELETES": "true"` to `env`.
-- **Read-only:** add `"MODE_READ_ONLY": "true"` to only allow browsing and fetching results.
+- **Read-only:** add `"MODE_READ_ONLY": "true"` to only allow browsing and fetching results. This also disables `run_report`, since running a report spends warehouse compute and adds run history.
 - **Anything else:** list tool names in `MODE_DISABLED_TOOLS`.
 
 A misspelled tool name in `MODE_DISABLED_TOOLS` stops the server with an error rather than silently leaving the tool enabled.
 
 ## Limitations / Safety
 
-**No query execution.** The server deliberately does not expose a "run this query" tool. The Mode API has no endpoint for running a single query — the only way to execute SQL is `POST /reports/{token}/runs`, which runs **every** query in the report at once. On reports with many or expensive queries, that's slow, costly, and impossible to predict from the agent's side. Instead, the server focuses on **browsing**, **authoring**, and **fetching results**:
-- Write and manage SQL queries through your agent, then run them in Mode's UI where costs and side effects are visible.
-- Use `get_run_results` to pull results from completed runs back into the conversation.
+**Running reports.** The Mode API has no endpoint for running a single query. `run_report` calls `POST /reports/{token}/runs`, which runs **every** query in the report at once, spends warehouse compute, and adds to the report's run history.
+- Keep reports small (or split them) while an agent iterates on SQL.
+- Rows are truncated to 50 per query by default, since the usual goal is checking that the SQL works. A failed query returns its warehouse error and `query_token`, which maps straight to `update_query`.
+- Parameters only take effect when the report has registered form fields: a `{% form %}` block in a query's SQL, saved in Mode. Queries created through the API aren't registered until someone saves them in the editor, and Mode then runs with the form defaults. `get_report` lists the registered `parameters`, and `run_report` warns when it sent parameters to a report with none.
+- `columns` keeps wide results (emails, impersonation links) out of the transcript.
+- If a run outlasts `timeout_seconds`, the result has `timed_out: true`; fetch it later with `get_run_results`.
+- To turn it off, set `MODE_READ_ONLY=true` or `MODE_DISABLED_TOOLS=run_report`.
+
+**Charts use undocumented endpoints.** Mode's public Charts API is read-only (`list_charts`, `get_chart`). `create_chart` and `update_chart` call the same endpoints Mode's own editor does (create a chart on a query, then patch its `view_vegas`), with your normal API token. They can break without notice; turn them off with `MODE_DISABLED_TOOLS=create_chart,update_chart` (or `MODE_READ_ONLY=true`).
+- Columns are checked against the query's latest succeeded run (run the report first), ignoring case. Each y column is plotted as `SUM(column)`.
+- `update_chart` only changes what you pass and keeps the chart's colors and formats. If you change the type or columns of a chart built in Mode's editor, and it has a shape the server can't read back, it asks for the full set of fields or for the change through `view`.
+- This server can't render charts, so check what it makes. Smoke test after upgrading Mode-facing code, on a scratch report with one succeeded run:
+  1. `create_chart` a bar chart, then open its `web_path` under `app.mode.com` and confirm it renders with the right axes.
+  2. `update_chart` with a new `title` and confirm the title changed and the colors didn't.
+  3. `update_chart` with `type="line"` and confirm the chart is rebuilt as a line.
+  4. `get_chart` with `include_vegas=true` and check `view_vegas` is still version 2.
+  5. Delete the chart in Mode's UI. There is no delete-chart tool.
 
 **Deletes are permission-scoped, not owner-scoped.** The server does not check who created a report or query; what you can delete is whatever your API token is allowed to delete in Mode. With a Member API key that's limited to your own permissions, but a Workspace API token has admin access and can delete **any** report or query in the Workspace. That's why the delete tools are off unless you set `MODE_ENABLE_DELETES=true`.
 

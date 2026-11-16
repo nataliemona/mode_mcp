@@ -50,6 +50,37 @@ def _hal(key, items):
     return {"_embedded": {key: items}}
 
 
+def _v2_chart(token, chart_type, title):
+    """A version 2 chart whose stale legacy `view` disagrees with `view_vegas`."""
+    return {
+        "token": token,
+        "view_version": 2,
+        "color_palette_token": "pal1",
+        "switch_view_token": "sv1",
+        "_forms": {
+            form: {"method": method, "action": f"/api/{WORKSPACE}/switch_views/sv1/visualizations/{token}"}
+            for form, method in (("edit", "patch"), ("destroy", "delete"))
+        },
+        "view": {"selectedChart": "table", "chartTitle": "stale"},
+        "view_vegas": {
+            "chartType": chart_type,
+            "title": title,
+            "format": {"colors": {"a": "#fff"}},
+            "encoding": {
+                "x": [{"id": "1", "formula": "[week]"}],
+                "y": [{"id": "2", "formula": "SUM([sessions])"}],
+                "row": [],
+                "marks": {
+                    "properties": {
+                        "color": {"values": [{"id": "3", "formula": "[browser]"}]},
+                        "size": {"values": []},
+                    }
+                },
+            },
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # _get_config
 # ---------------------------------------------------------------------------
@@ -376,12 +407,142 @@ async def test_get_report():
             ),
         )
     )
+    respx.get(f"{BASE}/reports/rpt1/queries/q1/charts").mock(
+        return_value=httpx.Response(
+            200, json=_hal("charts", [_v2_chart("c1", "line", "Revenue")])
+        )
+    )
 
     async with _test_client() as client:
         result = await server.get_report(_mock_ctx(client), "rpt1")
     assert result["token"] == "rpt1"
     assert len(result["queries"]) == 1
     assert "SELECT" in result["queries"][0]["raw_query"]
+    assert result["queries"][0]["charts"] == [
+        {"chart_token": "c1", "type": "line", "title": "Revenue"}
+    ]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_report_survives_chart_fetch_failure():
+    respx.get(f"{BASE}/reports/rpt1").mock(
+        return_value=httpx.Response(200, json={"token": "rpt1", "name": "R"})
+    )
+    respx.get(f"{BASE}/reports/rpt1/queries").mock(
+        return_value=httpx.Response(
+            200, json=_hal("queries", [{"token": "q1", "name": "revenue"}])
+        )
+    )
+    respx.get(f"{BASE}/reports/rpt1/queries/q1/charts").mock(
+        return_value=httpx.Response(500)
+    )
+
+    async with _test_client() as client:
+        result = await server.get_report(_mock_ctx(client), "rpt1")
+    assert result["queries"][0]["charts"] is None
+
+
+# ---------------------------------------------------------------------------
+# list_charts / get_chart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_charts_fans_out_over_queries():
+    respx.get(f"{BASE}/reports/rpt1/queries").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal(
+                "queries",
+                [{"token": "q1", "name": "revenue"}, {"token": "q2", "name": "users"}],
+            ),
+        )
+    )
+    respx.get(f"{BASE}/reports/rpt1/queries/q1/charts").mock(
+        return_value=httpx.Response(
+            200, json=_hal("charts", [_v2_chart("c1", "bar", "Revenue")])
+        )
+    )
+    respx.get(f"{BASE}/reports/rpt1/queries/q2/charts").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal(
+                "charts",
+                [
+                    {
+                        "token": "c2",
+                        "view_version": 1,
+                        "view": {"selectedChart": "pie", "chartTitle": "Users"},
+                        "view_vegas": {},
+                    }
+                ],
+            ),
+        )
+    )
+
+    async with _test_client() as client:
+        result = await server.list_charts(_mock_ctx(client), "rpt1")
+
+    assert result == [
+        {
+            "chart_token": "c1",
+            "type": "bar",
+            "title": "Revenue",
+            "query_token": "q1",
+            "query_name": "revenue",
+        },
+        {
+            "chart_token": "c2",
+            "type": "pie",
+            "title": "Users",
+            "query_token": "q2",
+            "query_name": "users",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_charts_single_query_skips_query_listing():
+    queries = respx.get(f"{BASE}/reports/rpt1/queries").mock(
+        return_value=httpx.Response(200, json=_hal("queries", []))
+    )
+    respx.get(f"{BASE}/reports/rpt1/queries/q1/charts").mock(
+        return_value=httpx.Response(200, json=_hal("charts", []))
+    )
+
+    async with _test_client() as client:
+        result = await server.list_charts(_mock_ctx(client), "rpt1", "q1")
+
+    assert result == []
+    assert queries.called is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_chart_omits_vegas_unless_requested():
+    respx.get(f"{BASE}/reports/rpt1/queries/q1/charts/c1").mock(
+        return_value=httpx.Response(200, json=_v2_chart("c1", "line", "Revenue"))
+    )
+
+    async with _test_client() as client:
+        slim = await server.get_chart(_mock_ctx(client), "rpt1", "q1", "c1")
+        full = await server.get_chart(
+            _mock_ctx(client), "rpt1", "q1", "c1", include_vegas=True
+        )
+
+    assert slim["type"] == "line"
+    assert slim["title"] == "Revenue"
+    assert slim["switch_view_token"] == "sv1"
+    assert slim["encoding"] == {
+        "x": ["[week]"],
+        "y": ["SUM([sessions])"],
+        "marks.color": ["[browser]"],
+    }
+    assert "view_vegas" not in slim
+    assert full["view_vegas"]["format"] == {"colors": {"a": "#fff"}}
 
 
 # ---------------------------------------------------------------------------
@@ -793,13 +954,17 @@ def test_disabled_tools_enable_deletes():
     assert server._disabled_tools({"MODE_ENABLE_DELETES": "true"}, ALL_TOOLS) == set()
 
 
+
 def test_disabled_tools_read_only_wins_over_enable_deletes():
     env = {"MODE_READ_ONLY": "true", "MODE_ENABLE_DELETES": "true"}
     assert server._disabled_tools(env, ALL_TOOLS) == server.WRITE_TOOLS
 
 
 def test_disabled_tools_list():
-    env = {"MODE_ENABLE_DELETES": "true", "MODE_DISABLED_TOOLS": " create_report, add_query ,"}
+    env = {
+        "MODE_ENABLE_DELETES": "true",
+        "MODE_DISABLED_TOOLS": " create_report, add_query ,",
+    }
     assert server._disabled_tools(env, ALL_TOOLS) == {"create_report", "add_query"}
 
 
@@ -1038,8 +1203,21 @@ async def test_fetch_run_results_parallel_mixed():
             json=_hal(
                 "query_runs",
                 [
-                    {"token": "qr1", "query_name": "good", "state": "succeeded"},
-                    {"token": "qr2", "query_name": "bad", "state": "failed"},
+                    {
+                        "token": "qr1",
+                        "query_token": "q1",
+                        "query_name": "good",
+                        "state": "succeeded",
+                    },
+                    {
+                        "token": "qr2",
+                        "query_token": "q2",
+                        "query_name": "bad",
+                        "state": "failed",
+                        "error_code": "SqlGenericError",
+                        "error_message": "SQL compilation error: syntax error line 14",
+                    },
+                    {"token": "qr3", "query_token": "q3", "query_name": "gone", "state": "succeeded"},
                 ],
             ),
         )
@@ -1047,13 +1225,907 @@ async def test_fetch_run_results_parallel_mixed():
     respx.get(
         f"{BASE}/reports/rpt1/runs/run1/query_runs/qr1/results/content.json"
     ).mock(return_value=httpx.Response(200, json=[{"ok": True}]))
-    respx.get(
+    failed_content = respx.get(
         f"{BASE}/reports/rpt1/runs/run1/query_runs/qr2/results/content.json"
+    ).mock(return_value=httpx.Response(404))
+    respx.get(
+        f"{BASE}/reports/rpt1/runs/run1/query_runs/qr3/results/content.json"
     ).mock(return_value=httpx.Response(404))
 
     async with _test_client() as client:
         results = await server._fetch_run_results(client, "rpt1", "run1")
 
-    assert len(results) == 2
+    assert len(results) == 3
     assert results[0]["data"] == [{"ok": True}]
-    assert results[1]["error"] == "HTTP 404"
+    assert results[0]["query_token"] == "q1"
+    assert results[1] == {
+        "query_name": "bad",
+        "query_token": "q2",
+        "state": "failed",
+        "error": "SQL compilation error: syntax error line 14",
+        "error_code": "SqlGenericError",
+    }
+    assert failed_content.called is False
+    assert results[2]["error"] == "HTTP 404"
+
+
+# ---------------------------------------------------------------------------
+# get_run_results — include_failed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_run_results_include_failed_picks_latest_any_state():
+    respx.get(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal(
+                "report_runs",
+                [
+                    {"token": "run2", "state": "failed"},
+                    {"token": "run1", "state": "succeeded"},
+                ],
+            ),
+        )
+    )
+    respx.get(f"{BASE}/reports/rpt1/runs/run2/query_runs").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal(
+                "query_runs",
+                [
+                    {
+                        "token": "qr1",
+                        "query_token": "q1",
+                        "query_name": "q",
+                        "state": "failed",
+                        "error_message": "boom",
+                    }
+                ],
+            ),
+        )
+    )
+
+    async with _test_client() as client:
+        result = await server.get_run_results(
+            _mock_ctx(client), "rpt1", include_failed=True
+        )
+    assert result[0]["error"] == "boom"
+    assert result[0]["query_token"] == "q1"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_run_results_include_failed_no_runs():
+    respx.get(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(200, json=_hal("report_runs", []))
+    )
+
+    async with _test_client() as client:
+        with pytest.raises(ToolError, match="No runs found"):
+            await server.get_run_results(
+                _mock_ctx(client), "rpt1", include_failed=True
+            )
+
+
+# ---------------------------------------------------------------------------
+# run_report
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Replace asyncio.sleep/time.monotonic in server with a manual clock."""
+    clock = {"now": 0.0, "sleeps": []}
+
+    async def _sleep(seconds):
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(server.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock["now"])
+    return clock
+
+
+def _mock_query_runs(run_token="run1", state="succeeded", **extra):
+    respx.get(f"{BASE}/reports/rpt1/runs/{run_token}/query_runs").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal(
+                "query_runs",
+                [
+                    {
+                        "token": "qr1",
+                        "query_token": "q1",
+                        "query_name": "big",
+                        "state": state,
+                        **extra,
+                    }
+                ],
+            ),
+        )
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_polls_until_succeeded(fake_clock):
+    post = respx.post(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(200, json={"token": "run1", "state": "pending"})
+    )
+    respx.get(f"{BASE}/reports/rpt1/runs/run1").mock(
+        side_effect=[
+            httpx.Response(200, json={"token": "run1", "state": "running"}),
+            httpx.Response(200, json={"token": "run1", "state": "succeeded"}),
+        ]
+    )
+    _mock_query_runs()
+    respx.get(
+        f"{BASE}/reports/rpt1/runs/run1/query_runs/qr1/results/content.json"
+    ).mock(return_value=httpx.Response(200, json=[{"i": i} for i in range(200)]))
+
+    async with _test_client() as client:
+        result = await server.run_report(
+            _mock_ctx(client), "rpt1", parameters={"weeks": 8}
+        )
+
+    assert json.loads(post.calls[0].request.content) == {"parameters": {"weeks": 8}}
+    assert result["run_token"] == "run1"
+    assert result["state"] == "succeeded"
+    query = result["queries"][0]
+    assert query["query_token"] == "q1"
+    assert query["row_count"] == 200
+    assert query["truncated"] is True
+    assert len(query["data"]) == 50
+    assert fake_clock["sleeps"] == [1.0, 1.5]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_without_parameters_posts_empty_body(fake_clock):
+    post = respx.post(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(200, json={"token": "run1", "state": "failed"})
+    )
+    _mock_query_runs(state="failed", error_message="bad column")
+
+    async with _test_client() as client:
+        result = await server.run_report(_mock_ctx(client), "rpt1")
+
+    assert json.loads(post.calls[0].request.content) == {}
+    assert result["state"] == "failed"
+    assert result["queries"][0]["error"] == "bad column"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_times_out(fake_clock):
+    respx.post(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(200, json={"token": "run1", "state": "pending"})
+    )
+    respx.get(f"{BASE}/reports/rpt1/runs/run1").mock(
+        return_value=httpx.Response(200, json={"token": "run1", "state": "running"})
+    )
+
+    async with _test_client() as client:
+        result = await server.run_report(
+            _mock_ctx(client), "rpt1", timeout_seconds=10
+        )
+
+    assert result == {"run_token": "run1", "state": "running", "timed_out": True}
+    assert fake_clock["now"] == 10
+    assert max(fake_clock["sleeps"]) <= 5.0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_no_wait_does_not_poll(fake_clock):
+    respx.post(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(200, json={"token": "run1", "state": "pending"})
+    )
+    poll = respx.get(f"{BASE}/reports/rpt1/runs/run1").mock(
+        return_value=httpx.Response(200, json={"token": "run1", "state": "succeeded"})
+    )
+
+    async with _test_client() as client:
+        result = await server.run_report(_mock_ctx(client), "rpt1", wait=False)
+
+    assert result == {"run_token": "run1", "state": "pending"}
+    assert poll.called is False
+    assert fake_clock["sleeps"] == []
+
+
+def test_disabled_tools_read_only_disables_run_report():
+    assert "run_report" in server.WRITE_TOOLS
+    disabled = server._disabled_tools({"MODE_READ_ONLY": "true"}, ALL_TOOLS)
+    assert "run_report" in disabled
+
+
+# ---------------------------------------------------------------------------
+# chart building
+# ---------------------------------------------------------------------------
+
+
+def _marks(vegas):
+    return vegas["encoding"]["marks"]
+
+
+def test_build_vegas_grouped_vertical_bar():
+    vegas = server._build_vegas("bar", "PATH", ["SESSIONS", "USERS"], None, "Top", False, False)
+    enc = vegas["encoding"]
+    assert vegas["chartType"] == "bar"
+    assert vegas["title"] == "Top"
+    assert [i["formula"] for i in enc["x"]] == ["[PATH]"]
+    assert [i["formula"] for i in enc["y"]] == ["$VALUES"]
+    assert [i["formula"] for i in enc["value"]] == ["SUM([SESSIONS])", "SUM([USERS])"]
+    series = _marks(vegas)["series"][0]
+    assert _marks(vegas)["channel"] == "y"
+    assert series["field"] == enc["y"][0]["id"]
+    assert series["properties"]["options"] == {"Bar": {"type": "Bar", "transform": "group"}}
+    assert [i["formula"] for i in series["properties"]["color"]["values"]] == ["$NAMES"]
+
+
+def test_build_vegas_stacked_horizontal_bar_swaps_axes():
+    vegas = server._build_vegas("bar", "PATH", ["SESSIONS"], "BROWSER", None, True, True)
+    enc = vegas["encoding"]
+    assert vegas["chartType"] == "hStackedBar"
+    assert [i["formula"] for i in enc["y"]] == ["[PATH]"]
+    assert [i["formula"] for i in enc["x"]] == ["$VALUES"]
+    assert _marks(vegas)["channel"] == "x"
+    props = _marks(vegas)["series"][0]["properties"]
+    assert props["options"]["Bar"]["transform"] == "stack"
+    assert [i["formula"] for i in props["color"]["values"]] == ["[BROWSER]"]
+
+
+def test_build_vegas_ids_are_unique():
+    vegas = server._build_vegas("line", "DAY", ["A", "B", "C"], "G", None, False, False)
+    ids = [i["id"] for ch in ("x", "y", "value") for i in vegas["encoding"][ch]]
+    ids += [i["id"] for i in _marks(vegas)["series"][0]["properties"]["color"]["values"]]
+    assert len(ids) == len(set(ids))
+
+
+def test_build_vegas_pie_big_number_table():
+    pie = server._build_vegas("pie", "PATH", ["SESSIONS"], None, None, False, False)
+    props = _marks(pie)["properties"]
+    assert pie["chartType"] == "pie"
+    assert _marks(pie)["channel"] == "*"
+    assert props["color"]["values"][0]["formula"] == "[PATH]"
+    assert props["angle"]["values"][0]["formula"] == "SUM([SESSIONS])"
+
+    big = server._build_vegas("big_number", None, ["SESSIONS"], None, None, False, False)
+    assert big["chartType"] == "bigValue"
+    assert _marks(big)["properties"]["text"]["values"][0]["formula"] == "SUM([SESSIONS])"
+
+    table = server._build_vegas("table", "PATH", ["SESSIONS", "USERS"], None, None, False, False)
+    texts = [i["formula"] for i in _marks(table)["properties"]["text"]["values"]]
+    assert texts == ["[PATH]", "[SESSIONS]", "[USERS]"]
+
+
+@pytest.mark.parametrize(
+    "chart_type, x, y, message",
+    [
+        ("line", None, ["A"], "line needs x and y"),
+        ("bar", "A", [], "bar needs x and y"),
+        ("big_number", "A", [], "big_number needs y"),
+        ("table", None, [], "table needs x or y"),
+    ],
+)
+def test_build_vegas_requires_columns(chart_type, x, y, message):
+    with pytest.raises(ToolError, match=message):
+        server._build_vegas(chart_type, x, y, None, None, False, False)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        dict(type="line", x="DAY", y=["A", "B"], color=None, stacked=False, horizontal=False),
+        dict(type="area", x="DAY", y=["A"], color="G", stacked=True, horizontal=False),
+        dict(type="bar", x="P", y=["A"], color="G", stacked=False, horizontal=False),
+        dict(type="bar", x="P", y=["A"], color=None, stacked=True, horizontal=True),
+        dict(type="pie", x="P", y=["A"], color=None, stacked=False, horizontal=False),
+        dict(type="big_number", x=None, y=["A"], color=None, stacked=False, horizontal=False),
+        dict(type="table", x=None, y=["A", "B"], color=None, stacked=False, horizontal=False),
+    ],
+)
+def test_describe_vegas_inverts_build_vegas(fields):
+    vegas = server._build_vegas(
+        fields["type"], fields["x"], fields["y"], fields["color"], None,
+        fields["stacked"], fields["horizontal"],
+    )
+    assert server._describe_vegas(vegas) == fields
+
+
+def test_describe_vegas_unreadable_shape_is_none():
+    vegas = server._build_vegas("line", "DAY", ["A"], None, None, False, False)
+    vegas["encoding"]["value"][0]["formula"] = "AVG([A])"
+    assert server._describe_vegas(vegas) is None
+
+
+def test_resolve_columns_ignores_case_and_lists_available():
+    assert server._resolve_columns(["path", "Sessions"], ["PATH", "SESSIONS"]) == ["PATH", "SESSIONS"]
+    with pytest.raises(ToolError, match=r"Unknown column\(s\): nope.*PATH, SESSIONS"):
+        server._resolve_columns(["nope"], ["PATH", "SESSIONS"])
+
+
+# ---------------------------------------------------------------------------
+# create_chart / update_chart
+# ---------------------------------------------------------------------------
+
+
+PALETTE = ["#111111", "#222222", "#333333"]
+
+
+def _mock_palette():
+    respx.get(f"{BASE}/color_palettes/pal1").mock(
+        return_value=httpx.Response(
+            200, json={"token": "pal1", "value": "#111111, #222222, #333333"}
+        )
+    )
+
+
+def _saved_vegas(route, call=0):
+    """The `view_vegas` object a mocked PATCH route received."""
+    body = json.loads(route.calls[call].request.content)["visualization"]
+    return json.loads(body["view_vegas"]), body
+
+
+def _mock_latest_columns(header="PATH,SESSIONS\r\n"):
+    respx.get(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal("report_runs", [{"token": "run1", "state": "succeeded"}]),
+        )
+    )
+    respx.get(f"{BASE}/reports/rpt1/runs/run1/query_runs").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal(
+                "query_runs",
+                [{"token": "qr1", "query_token": "q1", "state": "succeeded"}],
+            ),
+        )
+    )
+    return respx.get(
+        f"{BASE}/reports/rpt1/runs/run1/query_runs/qr1/results/content.csv"
+    ).mock(return_value=httpx.Response(200, text=header + "/,731967\r\n"))
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_create_chart_posts_then_patches_json_string():
+    _mock_latest_columns()
+    _mock_palette()
+    post = respx.post(f"{BASE}/reports/rpt1/queries/q1/charts").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                **_v2_chart("c9", "line", "x"),
+                "view_vegas": {},
+                "_links": {"report_viz_web": {"href": "/ws/reports/rpt1/viz/c9"}},
+            },
+        )
+    )
+    patch = respx.patch(f"{BASE}/switch_views/sv1/visualizations/c9").mock(
+        side_effect=lambda req: httpx.Response(
+            200,
+            json={
+                "token": "c9",
+                "view_version": 2,
+                "view_vegas": json.loads(json.loads(req.content)["visualization"]["view_vegas"]),
+            },
+        )
+    )
+
+    async with _test_client() as client:
+        result = await server.create_chart(
+            _mock_ctx(client), "rpt1", "q1", "bar", x="path", y=["sessions"], title="Top paths"
+        )
+
+    assert json.loads(post.calls[0].request.content) == {"chart": {"view_version": 2}}
+    body = json.loads(patch.calls[0].request.content)["visualization"]
+    assert body["view_version"] == 2
+    assert isinstance(body["view_vegas"], str)
+    vegas = json.loads(body["view_vegas"])
+    assert vegas["encoding"]["x"][0]["formula"] == "[PATH]"
+    assert vegas["encoding"]["value"][0]["formula"] == "SUM([SESSIONS])"
+    assert result == {
+        "chart_token": "c9",
+        "type": "bar",
+        "title": "Top paths",
+        "query_token": "q1",
+        "web_path": "/ws/reports/rpt1/viz/c9",
+    }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_create_chart_unknown_column_creates_nothing():
+    _mock_latest_columns()
+    post = respx.post(f"{BASE}/reports/rpt1/queries/q1/charts").mock(
+        return_value=httpx.Response(200, json=_v2_chart("c9", "line", "x"))
+    )
+
+    async with _test_client() as client:
+        with pytest.raises(ToolError, match="Unknown column.*bogus.*Available columns: PATH, SESSIONS"):
+            await server.create_chart(
+                _mock_ctx(client), "rpt1", "q1", "bar", x="bogus", y=["SESSIONS"]
+            )
+    assert post.called is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_create_chart_needs_a_succeeded_run():
+    respx.get(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(200, json=_hal("report_runs", []))
+    )
+
+    async with _test_client() as client:
+        with pytest.raises(ToolError, match="Call run_report first"):
+            await server.create_chart(
+                _mock_ctx(client), "rpt1", "q1", "line", x="A", y=["B"]
+            )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_create_chart_deletes_empty_chart_when_patch_fails():
+    _mock_latest_columns()
+    _mock_palette()
+    respx.post(f"{BASE}/reports/rpt1/queries/q1/charts").mock(
+        return_value=httpx.Response(200, json=_v2_chart("c9", "line", "x"))
+    )
+    respx.patch(f"{BASE}/switch_views/sv1/visualizations/c9").mock(
+        return_value=httpx.Response(500)
+    )
+    delete = respx.delete(f"{BASE}/switch_views/sv1/visualizations/c9").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    async with _test_client() as client:
+        with pytest.raises(ToolError):
+            await server.create_chart(
+                _mock_ctx(client), "rpt1", "q1", "line", x="PATH", y=["SESSIONS"]
+            )
+    assert delete.called is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_create_chart_view_overrides_simple_fields():
+    _mock_latest_columns()
+    _mock_palette()
+    respx.post(f"{BASE}/reports/rpt1/queries/q1/charts").mock(
+        return_value=httpx.Response(200, json=_v2_chart("c9", "line", "x"))
+    )
+    patch = respx.patch(f"{BASE}/switch_views/sv1/visualizations/c9").mock(
+        return_value=httpx.Response(200, json={"token": "c9", "view_version": 2})
+    )
+
+    async with _test_client() as client:
+        await server.create_chart(
+            _mock_ctx(client), "rpt1", "q1", "bar", x="PATH", y=["SESSIONS"],
+            title="simple", view={"title": "raw", "format": {"legend": {"enabled": False}}},
+        )
+
+    vegas = json.loads(json.loads(patch.calls[0].request.content)["visualization"]["view_vegas"])
+    assert vegas["title"] == "raw"
+    assert vegas["format"]["legend"]["enabled"] is False
+    assert vegas["format"]["legend"]["position"] == "auto"
+    assert vegas["chartType"] == "bar"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_update_chart_title_keeps_formatting_and_skips_column_lookup():
+    _mock_palette()
+    respx.get(f"{BASE}/reports/rpt1/queries/q1/charts/c1").mock(
+        return_value=httpx.Response(200, json=_v2_chart("c1", "line", "Old"))
+    )
+    patch = respx.patch(f"{BASE}/switch_views/sv1/visualizations/c1").mock(
+        side_effect=lambda req: httpx.Response(
+            200,
+            json={
+                "token": "c1",
+                "view_version": 2,
+                "view_vegas": json.loads(json.loads(req.content)["visualization"]["view_vegas"]),
+            },
+        )
+    )
+    runs = respx.get(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(200, json=_hal("report_runs", []))
+    )
+
+    async with _test_client() as client:
+        result = await server.update_chart(_mock_ctx(client), "rpt1", "q1", "c1", title="New")
+
+    vegas = json.loads(json.loads(patch.calls[0].request.content)["visualization"]["view_vegas"])
+    assert vegas["title"] == "New"
+    assert vegas["format"]["colors"]["a"] == "#fff"
+    assert vegas["encoding"]["x"][0]["formula"] == "[week]"
+    assert result["title"] == "New"
+    assert runs.called is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_update_chart_type_change_rebuilds_encoding_but_keeps_format():
+    _mock_latest_columns("week,sessions\r\n")
+    _mock_palette()
+    chart = _v2_chart("c1", "line", "Revenue")
+    chart["view_vegas"]["encoding"]["value"] = [{"id": "4", "formula": "SUM([sessions])"}]
+    respx.get(f"{BASE}/reports/rpt1/queries/q1/charts/c1").mock(
+        return_value=httpx.Response(200, json=chart)
+    )
+    patch = respx.patch(f"{BASE}/switch_views/sv1/visualizations/c1").mock(
+        return_value=httpx.Response(200, json={"token": "c1", "view_version": 2})
+    )
+
+    async with _test_client() as client:
+        await server.update_chart(
+            _mock_ctx(client), "rpt1", "q1", "c1", type="bar", color="week"
+        )
+
+    vegas = json.loads(json.loads(patch.calls[0].request.content)["visualization"]["view_vegas"])
+    assert vegas["chartType"] == "bar"
+    assert vegas["title"] == "Revenue"
+    assert vegas["format"]["colors"]["a"] == "#fff"
+    assert vegas["encoding"]["x"][0]["formula"] == "[week]"
+    assert vegas["encoding"]["value"][0]["formula"] == "SUM([sessions])"
+    series = vegas["encoding"]["marks"]["series"][0]["properties"]
+    assert series["color"]["values"][0]["formula"] == "[week]"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_update_chart_unreadable_chart_needs_full_fields():
+    chart = _v2_chart("c1", "line", "Hand made")
+    chart["view_vegas"]["encoding"]["y"][0]["formula"] = "$VALUES"
+    chart["view_vegas"]["encoding"]["value"] = [{"id": "9", "formula": "AVG([sessions])"}]
+    respx.get(f"{BASE}/reports/rpt1/queries/q1/charts/c1").mock(
+        return_value=httpx.Response(200, json=chart)
+    )
+    patch = respx.patch(f"{BASE}/switch_views/sv1/visualizations/c1")
+
+    async with _test_client() as client:
+        with pytest.raises(ToolError, match="can't read back"):
+            await server.update_chart(_mock_ctx(client), "rpt1", "q1", "c1", color="browser")
+    assert patch.called is False
+
+
+# ---------------------------------------------------------------------------
+# run_report — parameters feedback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_warns_when_no_form_fields_registered(fake_clock):
+    respx.post(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(
+            200,
+            json={"token": "run1", "state": "succeeded", "parameters": {"weeks": "2"}, "form_fields": []},
+        )
+    )
+    _mock_query_runs()
+    respx.get(
+        f"{BASE}/reports/rpt1/runs/run1/query_runs/qr1/results/content.json"
+    ).mock(return_value=httpx.Response(200, json=[{"a": 1}]))
+
+    async with _test_client() as client:
+        result = await server.run_report(
+            _mock_ctx(client), "rpt1", parameters={"weeks": 2}
+        )
+
+    assert result["applied_parameters"] == {"weeks": "2"}
+    assert len(result["warnings"]) == 1
+    assert "weeks" in result["warnings"][0]
+    assert "{% form %}" in result["warnings"][0]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_no_warning_with_registered_form_fields(fake_clock):
+    respx.post(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "token": "run1",
+                "state": "succeeded",
+                "parameters": {"weeks": "2"},
+                "form_fields": [{"name": "weeks"}],
+            },
+        )
+    )
+    _mock_query_runs()
+    respx.get(
+        f"{BASE}/reports/rpt1/runs/run1/query_runs/qr1/results/content.json"
+    ).mock(return_value=httpx.Response(200, json=[{"a": 1}]))
+
+    async with _test_client() as client:
+        result = await server.run_report(
+            _mock_ctx(client), "rpt1", parameters={"weeks": 2}
+        )
+
+    assert result["applied_parameters"] == {"weeks": "2"}
+    assert "warnings" not in result
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_no_warning_without_parameters_or_form_data(fake_clock):
+    respx.post(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(
+            200, json={"token": "run1", "state": "succeeded", "form_fields": []}
+        )
+    )
+    _mock_query_runs()
+    respx.get(
+        f"{BASE}/reports/rpt1/runs/run1/query_runs/qr1/results/content.json"
+    ).mock(return_value=httpx.Response(200, json=[]))
+
+    async with _test_client() as client:
+        plain = await server.run_report(_mock_ctx(client), "rpt1")
+    assert "warnings" not in plain
+    assert "applied_parameters" not in plain
+
+
+# ---------------------------------------------------------------------------
+# columns filter
+# ---------------------------------------------------------------------------
+
+
+def test_project_rows_matches_case_insensitively_and_reports_missing():
+    rows = [{"EMAIL": "a@x.com", "PATH": "/", "N": 1}]
+    projected, missing = server._project_rows(rows, ["path", "n", "nope"])
+    assert projected == [{"PATH": "/", "N": 1}]
+    assert missing == ["nope"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_run_results_columns_drops_other_columns_before_truncation():
+    rows = [{"EMAIL": f"u{i}@x.com", "PATH": "/", "N": i} for i in range(80)]
+    respx.get(f"{BASE}/reports/rpt1/runs/run1/query_runs").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal(
+                "query_runs",
+                [{"token": "qr1", "query_name": "q", "state": "succeeded"}],
+            ),
+        )
+    )
+    respx.get(
+        f"{BASE}/reports/rpt1/runs/run1/query_runs/qr1/results/content.json"
+    ).mock(return_value=httpx.Response(200, json=rows))
+
+    async with _test_client() as client:
+        result = await server.get_run_results(
+            _mock_ctx(client), "rpt1", "run1",
+            max_rows_per_query=10, columns=["path", "n", "ghost"],
+        )
+
+    assert result[0]["row_count"] == 80
+    assert result[0]["truncated"] is True
+    assert result[0]["data"][0] == {"PATH": "/", "N": 0}
+    assert all("EMAIL" not in row for row in result[0]["data"])
+    assert result[0]["missing_columns"] == ["ghost"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_columns(fake_clock):
+    respx.post(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(200, json={"token": "run1", "state": "succeeded"})
+    )
+    _mock_query_runs()
+    respx.get(
+        f"{BASE}/reports/rpt1/runs/run1/query_runs/qr1/results/content.json"
+    ).mock(return_value=httpx.Response(200, json=[{"EMAIL": "a@x.com", "N": 1}]))
+
+    async with _test_client() as client:
+        result = await server.run_report(_mock_ctx(client), "rpt1", columns=["n"])
+
+    assert result["queries"][0]["data"] == [{"N": 1}]
+
+
+# ---------------------------------------------------------------------------
+# get_report — parameters
+# ---------------------------------------------------------------------------
+
+
+def _mock_report_with_last_run(last_run_response):
+    respx.get(f"{BASE}/reports/rpt1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "token": "rpt1",
+                "name": "R",
+                "_links": {"last_run": {"href": f"/api/{WORKSPACE}/reports/rpt1/runs/run1"}},
+            },
+        )
+    )
+    respx.get(f"{BASE}/reports/rpt1/queries").mock(
+        return_value=httpx.Response(200, json=_hal("queries", []))
+    )
+    respx.get(f"{BASE}/reports/rpt1/runs/run1").mock(return_value=last_run_response)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_report_exposes_registered_form_fields():
+    fields = [{"name": "weeks", "type": "text", "default": "16"}]
+    _mock_report_with_last_run(
+        httpx.Response(200, json={"token": "run1", "form_fields": fields})
+    )
+
+    async with _test_client() as client:
+        result = await server.get_report(_mock_ctx(client), "rpt1")
+    assert result["parameters"] == fields
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_report_parameters_empty_vs_unreadable():
+    _mock_report_with_last_run(
+        httpx.Response(200, json={"token": "run1", "form_fields": []})
+    )
+    async with _test_client() as client:
+        assert (await server.get_report(_mock_ctx(client), "rpt1"))["parameters"] == []
+
+    respx.reset()
+    _mock_report_with_last_run(httpx.Response(500))
+    async with _test_client() as client:
+        assert (await server.get_report(_mock_ctx(client), "rpt1"))["parameters"] is None
+
+
+# ---------------------------------------------------------------------------
+# default format and color settings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_create_chart_fills_default_format_colors_and_palette():
+    _mock_latest_columns("PATH,SESSIONS,USERS\r\n")
+    _mock_palette()
+    respx.post(f"{BASE}/reports/rpt1/queries/q1/charts").mock(
+        return_value=httpx.Response(200, json=_v2_chart("c9", "line", "x"))
+    )
+    patch = respx.patch(f"{BASE}/switch_views/sv1/visualizations/c9").mock(
+        return_value=httpx.Response(200, json={"token": "c9", "view_version": 2})
+    )
+
+    async with _test_client() as client:
+        await server.create_chart(
+            _mock_ctx(client), "rpt1", "q1", "line", x="PATH", y=["SESSIONS", "USERS"]
+        )
+
+    vegas, body = _saved_vegas(patch)
+    assert body["color_palette_token"] == "pal1"
+    assert vegas["format"]["colors"] == {"theme": "pal1", "custom": PALETTE, "map": {}}
+    assert vegas["format"]["useMuzeRenderer"] is True
+    assert set(vegas["format"]) >= {
+        "xAxis", "yAxis", "y2Axis", "legend", "flatTable", "bigValue", "nullToZero", "showValues",
+    }
+    assert vegas["format"]["xAxis"]["numberRange"] == {"min": None, "max": None}
+    assert vegas["fieldColors"] == {
+        "@DIS_$NAMES": {
+            "colorPaletteToken": "pal1",
+            "palette": PALETTE,
+            "map": {"SESSIONS": 0, "USERS": 1},
+        }
+    }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_create_chart_uses_default_palette_when_chart_has_none():
+    _mock_latest_columns()
+    _mock_palette()
+    respx.get(f"{BASE}/color_palettes").mock(
+        return_value=httpx.Response(
+            200,
+            json=_hal(
+                "color_palettes",
+                [{"token": "other", "is_default": False}, {"token": "pal1", "is_default": True}],
+            ),
+        )
+    )
+    created = {**_v2_chart("c9", "line", "x"), "color_palette_token": None}
+    respx.post(f"{BASE}/reports/rpt1/queries/q1/charts").mock(
+        return_value=httpx.Response(200, json=created)
+    )
+    patch = respx.patch(f"{BASE}/switch_views/sv1/visualizations/c9").mock(
+        return_value=httpx.Response(200, json={"token": "c9", "view_version": 2})
+    )
+
+    async with _test_client() as client:
+        await server.create_chart(
+            _mock_ctx(client), "rpt1", "q1", "table", x="PATH", y=["SESSIONS"]
+        )
+
+    vegas, body = _saved_vegas(patch)
+    assert body["color_palette_token"] == "pal1"
+    assert vegas["format"]["colors"]["theme"] == "pal1"
+    assert vegas["format"]["useMuzeRenderer"] is False
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_update_chart_with_no_changes_repairs_missing_defaults():
+    _mock_palette()
+    chart = _v2_chart("c1", "line", "Old")
+    chart["color_palette_token"] = None
+    del chart["view_vegas"]["format"]
+    respx.get(f"{BASE}/reports/rpt1/queries/q1/charts/c1").mock(
+        return_value=httpx.Response(200, json=chart)
+    )
+    respx.get(f"{BASE}/color_palettes").mock(
+        return_value=httpx.Response(
+            200, json=_hal("color_palettes", [{"token": "pal1", "is_default": True}])
+        )
+    )
+    patch = respx.patch(f"{BASE}/switch_views/sv1/visualizations/c1").mock(
+        return_value=httpx.Response(200, json={"token": "c1", "view_version": 2})
+    )
+
+    async with _test_client() as client:
+        await server.update_chart(_mock_ctx(client), "rpt1", "q1", "c1")
+
+    vegas, body = _saved_vegas(patch)
+    assert body["color_palette_token"] == "pal1"
+    assert vegas["format"]["colors"] == {"theme": "pal1", "custom": PALETTE, "map": {}}
+    assert vegas["title"] == "Old"
+    assert vegas["encoding"]["x"][0]["formula"] == "[week]"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_update_chart_never_overwrites_existing_format_or_field_colors():
+    _mock_palette()
+    chart = _v2_chart("c1", "line", "Old")
+    chart["view_vegas"]["format"] = {
+        "colors": {"theme": "mine", "custom": ["#abcdef"], "map": {"a": "#000"}},
+        "legend": {"enabled": False},
+    }
+    chart["view_vegas"]["fieldColors"] = {
+        "@DIS_[browser]": {"colorPaletteToken": "mine", "palette": ["#abcdef"], "map": {"x": 0}}
+    }
+    respx.get(f"{BASE}/reports/rpt1/queries/q1/charts/c1").mock(
+        return_value=httpx.Response(200, json=chart)
+    )
+    patch = respx.patch(f"{BASE}/switch_views/sv1/visualizations/c1").mock(
+        return_value=httpx.Response(200, json={"token": "c1", "view_version": 2})
+    )
+
+    async with _test_client() as client:
+        await server.update_chart(_mock_ctx(client), "rpt1", "q1", "c1", title="New")
+
+    vegas, _ = _saved_vegas(patch)
+    assert vegas["format"]["colors"] == {
+        "theme": "mine", "custom": ["#abcdef"], "map": {"a": "#000"}
+    }
+    assert vegas["format"]["legend"] == {
+        "enabled": False, "position": "auto", "title": None, "titleEnabled": True, "baseFormat": {},
+    }
+    assert vegas["fieldColors"]["@DIS_[browser]"]["map"] == {"x": 0}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_palette_falls_back_to_modes_predefined_default():
+    respx.get(f"{BASE}/color_palettes").mock(
+        return_value=httpx.Response(
+            200, json=_hal("color_palettes", [{"token": "custom", "is_default": False}])
+        )
+    )
+    respx.get(f"{BASE}/color_palettes/{server.MODE_DEFAULT_PALETTE}").mock(
+        return_value=httpx.Response(200, json={"value": "#111111, #222222"})
+    )
+
+    async with _test_client() as client:
+        token, colors = await server._palette(client, None)
+
+    assert token == server.MODE_DEFAULT_PALETTE
+    assert colors == ["#111111", "#222222"]

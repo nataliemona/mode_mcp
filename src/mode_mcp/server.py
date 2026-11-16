@@ -15,13 +15,17 @@ Env vars:
 """
 
 import asyncio
+import csv
 import hashlib
 import json
 import os
+import re
+import secrets
+import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from mcp.server.mcpserver import Context, MCPServer
@@ -265,9 +269,29 @@ async def search_reports(
     return matches[:limit]
 
 
+async def _report_parameters(
+    mode: ModeContext, report: dict[str, Any]
+) -> list[Any] | None:
+    """The form fields on the report's latest run, or None if unreadable."""
+    href = report.get("_links", {}).get("last_run", {}).get("href")
+    if not href:
+        return None
+    try:
+        resp = await mode.client.get(href.removeprefix(f"/api/{mode.workspace}"))
+        _check(resp)
+    except (httpx.HTTPError, ToolError):
+        return None
+    return resp.json().get("form_fields") or []
+
+
 @mcp.tool()
 async def get_report(ctx: Context, report_token: str) -> dict[str, Any]:
-    """Get a report's details and its queries (SQL).
+    """Get a report's details, its queries (SQL) and their charts.
+
+    `parameters` are the form fields Mode has registered for the report (as
+    recorded on its latest run), i.e. what run_report can take as `parameters`.
+    It is null when that couldn't be read, and empty when the report has none;
+    a `{% form %}` in the SQL only counts once it is saved in Mode.
 
     Args:
         report_token: The report token.
@@ -282,6 +306,11 @@ async def get_report(ctx: Context, report_token: str) -> dict[str, Any]:
 
     report = report_resp.json()
     queries = _embedded(queries_resp.json(), "queries")
+    charts_by_query = await asyncio.gather(
+        *[_fetch_charts(mode.client, report_token, q["token"]) for q in queries],
+        return_exceptions=True,
+    )
+    parameters = await _report_parameters(mode, report)
 
     return {
         "token": report["token"],
@@ -290,6 +319,7 @@ async def get_report(ctx: Context, report_token: str) -> dict[str, Any]:
         "archived": bool(report.get("archived")),
         "created_at": report.get("created_at"),
         "last_run_at": report.get("last_run_at"),
+        "parameters": parameters,
         "queries": [
             {
                 "token": q["token"],
@@ -297,8 +327,13 @@ async def get_report(ctx: Context, report_token: str) -> dict[str, Any]:
                 "creator": _creator(q),
                 "raw_query": q.get("raw_query", ""),
                 "data_source_id": q.get("data_source_id"),
+                "charts": (
+                    None
+                    if isinstance(charts, BaseException)
+                    else [_chart_summary(c) for c in charts]
+                ),
             }
-            for q in queries
+            for q, charts in zip(queries, charts_by_query)
         ],
     }
 
@@ -329,6 +364,743 @@ async def list_report_runs(
         }
         for r in runs[:limit]
     ]
+
+
+# ---------------------------------------------------------------------------
+# Charts
+# ---------------------------------------------------------------------------
+
+ENCODING_CHANNELS = ("x", "y", "x2", "y2", "value", "row", "column")
+
+
+async def _fetch_charts(
+    client: httpx.AsyncClient, report_token: str, query_token: str
+) -> list[dict[str, Any]]:
+    """Fetch the raw chart objects attached to one query."""
+    resp = await client.get(f"/reports/{report_token}/queries/{query_token}/charts")
+    _check(resp)
+    return _embedded(resp.json(), "charts")
+
+
+def _chart_summary(chart: dict[str, Any]) -> dict[str, Any]:
+    """Chart token, type and title.
+
+    Version 2 charts render from `view_vegas` and their legacy `view` is stale,
+    so it is only read for version 1 charts or charts with no `view_vegas` yet.
+    """
+    vegas = chart.get("view_vegas") or {}
+    if chart.get("view_version") == 2 and vegas:
+        chart_type, title = vegas.get("chartType"), vegas.get("title")
+    else:
+        view = chart.get("view") or {}
+        chart_type, title = view.get("selectedChart"), view.get("chartTitle")
+    return {"chart_token": chart["token"], "type": chart_type, "title": title}
+
+
+def _encoding_digest(vegas: dict[str, Any]) -> dict[str, list[str]]:
+    """The formulas bound to each channel of a `view_vegas` encoding.
+
+    e.g. {"x": ["[week]"], "y": ["SUM([sessions])"], "marks.color": ["[browser]"]}.
+    """
+    encoding = vegas.get("encoding") or {}
+    digest = {
+        channel: [item.get("formula") for item in encoding[channel]]
+        for channel in ENCODING_CHANNELS
+        if encoding.get(channel)
+    }
+    properties = (encoding.get("marks") or {}).get("properties") or {}
+    for name, prop in properties.items():
+        values = prop.get("values") if isinstance(prop, dict) else None
+        if values:
+            digest[f"marks.{name}"] = [item.get("formula") for item in values]
+    return digest
+
+
+@mcp.tool()
+async def list_charts(
+    ctx: Context, report_token: str, query_token: str | None = None
+) -> list[dict[str, Any]]:
+    """List the charts in a report, or on one query.
+
+    Args:
+        report_token: The report token.
+        query_token: Only list charts on this query. If omitted, covers every
+            query in the report.
+    """
+    mode = _mode(ctx)
+    if query_token:
+        queries = [{"token": query_token, "name": None}]
+    else:
+        queries_resp = await mode.client.get(f"/reports/{report_token}/queries")
+        _check(queries_resp)
+        queries = _embedded(queries_resp.json(), "queries")
+
+    charts_by_query = await asyncio.gather(
+        *[_fetch_charts(mode.client, report_token, q["token"]) for q in queries]
+    )
+    return [
+        {
+            **_chart_summary(chart),
+            "query_token": q["token"],
+            "query_name": q.get("name"),
+        }
+        for q, charts in zip(queries, charts_by_query)
+        for chart in charts
+    ]
+
+
+@mcp.tool()
+async def get_chart(
+    ctx: Context,
+    report_token: str,
+    query_token: str,
+    chart_token: str,
+    include_vegas: bool = False,
+) -> dict[str, Any]:
+    """Get one chart's type, title and what it plots.
+
+    For version 2 charts `encoding` lists the formulas bound to each channel
+    (x, y, color, ...). The full `view_vegas` is large (tens of KB), so it is
+    only returned with `include_vegas`; pass it when you need to copy or edit
+    a chart's raw settings.
+
+    Args:
+        report_token: The report token.
+        query_token: The query the chart is attached to.
+        chart_token: The chart token.
+        include_vegas: Also return the raw `view_vegas` object.
+    """
+    mode = _mode(ctx)
+    resp = await mode.client.get(
+        f"/reports/{report_token}/queries/{query_token}/charts/{chart_token}"
+    )
+    _check(resp)
+    chart = resp.json()
+    vegas = chart.get("view_vegas") or {}
+    out: dict[str, Any] = {
+        **_chart_summary(chart),
+        "query_token": query_token,
+        "view_version": chart.get("view_version"),
+        "switch_view_token": chart.get("switch_view_token"),
+        "view": chart.get("view"),
+        "encoding": _encoding_digest(vegas),
+    }
+    if include_vegas:
+        out["view_vegas"] = vegas
+    return out
+
+
+ChartType = Literal["line", "bar", "area", "pie", "table", "big_number"]
+Orientation = Literal["vertical", "horizontal"]
+
+MARK_CHANNELS = ("baseline", "color", "size", "text", "label", "detail", "angle", "tooltip")
+
+# Mode's chartType for each (type, stacked, horizontal) combination.
+BAR_CHART_TYPES = {
+    (False, False): "bar",
+    (True, False): "stackedBar",
+    (False, True): "hBar",
+    (True, True): "hStackedBar",
+}
+CHART_TYPES = {
+    "line": "line", "area": "area", "pie": "pie", "table": "table", "big_number": "bigValue",
+}
+
+
+# Mode's predefined default palette ("Mode Ten"). Workspace palette listings only
+# include custom palettes, so this is the fallback when none is marked default.
+MODE_DEFAULT_PALETTE = "e7882faa26e7"
+
+# Mode's default `format` for a chart, minus `colors` (which come from the palette).
+DEFAULT_FORMAT: dict[str, Any] = {
+    "xAxis": {
+        "rotate": None,
+        "dateFormat": "auto",
+        "numberRange": {
+            "min": None,
+            "max": None
+        },
+        "numberFormat": {
+            "format": None,
+            "precision": None
+        },
+        "title": None,
+        "titleEnabled": True,
+        "compact": False,
+        "showAxisLabels": True,
+        "axisLabels": None,
+        "baseFormat": {}
+    },
+    "yAxis": {
+        "numberRange": {
+            "min": None,
+            "max": None
+        },
+        "numberFormat": {
+            "format": None,
+            "precision": None
+        },
+        "title": None,
+        "titleEnabled": True,
+        "scaleType": "linear",
+        "baseFormat": {},
+        "valueFieldFormatMap": {}
+    },
+    "y2Axis": {
+        "numberRange": {
+            "min": None,
+            "max": None
+        },
+        "numberFormat": {
+            "format": None,
+            "precision": None
+        },
+        "title": None,
+        "titleEnabled": True,
+        "scaleType": "linear",
+        "baseFormat": {}
+    },
+    "flatTable": {
+        "general": {
+            "sizingStyle": "sizeToFit",
+            "colorScheme": "mode-gray",
+            "density": "standard",
+            "colGridlines": True,
+            "rowGridlines": True,
+            "rowNumbers": False,
+            "dataProfilingEnabled": True,
+            "pageSize": 100
+        },
+        "columns": []
+    },
+    "legend": {
+        "enabled": True,
+        "position": "auto",
+        "title": None,
+        "titleEnabled": True,
+        "baseFormat": {}
+    },
+    "bigValue": {
+        "description": None,
+        "primaryTrendFormat": {
+            "label": None
+        }
+    },
+    "nullToZero": False,
+    "showValues": True,
+    "pieLabelsNotPercentages": False,
+    "drilldownEnabled": True,
+    "useMuzeRenderer": True
+}
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge `override` into `base`; lists and scalars are replaced."""
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _resolve_columns(names: list[str], available: list[str]) -> list[str]:
+    """Match requested column names to the result's columns, ignoring case.
+
+    Warehouses differ in the case they return (Snowflake upper-cases), so a
+    near match is rewritten to the canonical name instead of rejected.
+    """
+    lookup = {c.lower(): c for c in available}
+    missing = [n for n in names if n.lower() not in lookup]
+    if missing:
+        raise ToolError(
+            f"Unknown column(s): {', '.join(missing)}. "
+            f"Available columns: {', '.join(available)}."
+        )
+    return [lookup[n.lower()] for n in names]
+
+
+async def _latest_columns(
+    client: httpx.AsyncClient, report_token: str, query_token: str
+) -> list[str]:
+    """Column names from a query's latest succeeded run.
+
+    Reads only the CSV header line, since the JSON result can be huge.
+    """
+    runs_resp = await client.get(
+        f"/reports/{report_token}/runs",
+        params={"order": "desc", "order_by": "created_at"},
+    )
+    _check(runs_resp)
+    run = next(
+        (r for r in _embedded(runs_resp.json(), "report_runs") if r.get("state") == "succeeded"),
+        None,
+    )
+    if run is None:
+        raise ToolError(
+            "No succeeded run to read columns from. Call run_report first."
+        )
+    qr_resp = await client.get(f"/reports/{report_token}/runs/{run['token']}/query_runs")
+    _check(qr_resp)
+    qr = next(
+        (
+            q
+            for q in _embedded(qr_resp.json(), "query_runs")
+            if q.get("query_token") == query_token and q.get("state") == "succeeded"
+        ),
+        None,
+    )
+    if qr is None:
+        raise ToolError(
+            "The latest succeeded run has no results for this query. Call run_report first."
+        )
+
+    results = f"/reports/{report_token}/runs/{run['token']}/query_runs/{qr['token']}/results"
+    async with client.stream("GET", f"{results}/content.csv") as resp:
+        if resp.status_code == 200:
+            async for line in resp.aiter_lines():
+                header = next(csv.reader([line.lstrip("﻿")]))
+                if header:
+                    return header
+    json_resp = await client.get(f"{results}/content.json")
+    _check(json_resp)
+    rows = json_resp.json()
+    if not rows:
+        raise ToolError("The latest succeeded run returned no rows, so there are no columns.")
+    return list(rows[0])
+
+
+def _build_vegas(
+    type: ChartType,
+    x: str | None,
+    y: list[str],
+    color: str | None,
+    title: str | None,
+    stacked: bool,
+    horizontal: bool,
+) -> dict[str, Any]:
+    """A version 2 `view_vegas` object for the simple chart fields.
+
+    Follows the shapes Mode's own editor produces: cartesian charts bind the
+    category column and `$VALUES` to the axes with one SUM measure per y column;
+    pie, table and big-number charts put their columns in the mark properties.
+    """
+    needs = {
+        "line": x and y, "bar": x and y, "area": x and y,
+        "pie": x and y, "big_number": y, "table": x or y,
+    }
+    if not needs[type]:
+        raise ToolError(
+            {"big_number": "big_number needs y.", "table": "table needs x or y."}.get(
+                type, f"{type} needs x and y."
+            )
+        )
+
+    seen: set[str] = set()
+
+    def item(formula: str, kind: str) -> dict[str, Any]:
+        while (item_id := secrets.token_hex(2)) in seen:
+            pass
+        seen.add(item_id)
+        return {"id": item_id, "formula": formula, "variable": {"type": kind}}
+
+    def properties(mark: dict[str, Any], values: dict[str, list], options: dict) -> dict:
+        return {
+            "type": mark,
+            **{name: {"values": values.get(name, [])} for name in MARK_CHANNELS},
+            "options": options,
+        }
+
+    encoding: dict[str, Any] = {
+        channel: [] for channel in ("row", "column", "x", "y", "x2", "y2", "value")
+    }
+    if type in ("line", "bar", "area"):
+        category, measure = ("y", "x") if horizontal else ("x", "y")
+        mark = {"line": "Line", "bar": "Bar", "area": "Area"}[type]
+        values_field = item("$VALUES", "CONTINUOUS")
+        encoding[category] = [item(f"[{x}]", "DISCRETE")]
+        encoding[measure] = [values_field]
+        encoding["value"] = [item(f"SUM([{c}])", "CONTINUOUS") for c in y]
+        color_formula = f"[{color}]" if color else "$NAMES" if len(y) > 1 else None
+        options = (
+            {mark: {"type": mark, "transform": "stack" if stacked else "group"}}
+            if type == "bar"
+            else {mark: {"type": mark, "transform": "stack"}} if type == "area" and stacked
+            else {}
+        )
+        encoding["marks"] = {
+            "channel": measure,
+            "series": [
+                {
+                    "field": values_field["id"],
+                    "properties": properties(
+                        {"value": mark, "automatic": False},
+                        {"color": [item(color_formula, "DISCRETE")]} if color_formula else {},
+                        options,
+                    ),
+                }
+            ],
+            "properties": properties({"value": None, "automatic": True}, {}, {}),
+        }
+        chart_type = (
+            BAR_CHART_TYPES[(stacked, horizontal)] if type == "bar" else CHART_TYPES[type]
+        )
+    else:
+        if type == "pie":
+            values = {
+                "color": [item(f"[{x}]", "DISCRETE")],
+                "angle": [item(f"SUM([{y[0]}])", "CONTINUOUS")],
+            }
+            mark = {"value": "Pie", "automatic": False}
+        elif type == "big_number":
+            values = {"text": [item(f"SUM([{y[0]}])", "CONTINUOUS")]}
+            mark = {"value": "Text", "automatic": True}
+        else:
+            values = {"text": [item(f"[{c}]", "DISCRETE") for c in ([x] if x else []) + y]}
+            mark = {"value": "Text", "automatic": True}
+        encoding["marks"] = {
+            "channel": "*",
+            "series": [],
+            "properties": properties(mark, values, {}),
+        }
+        chart_type = CHART_TYPES[type]
+
+    encoding.update(
+        sorts=[], filter=[], totals={"grand": {"row": False, "column": False}}, groups=[]
+    )
+    return {
+        "encoding": encoding,
+        "chartType": chart_type,
+        "title": title or "",
+        "description": "",
+        "caption": {"text": "", "isHidden": False, "isTitleHidden": False, "position": "top"},
+        "fieldFormats": {},
+        "facetSizes": {},
+        "isAutoUpdateDisabled": False,
+    }
+
+
+def _describe_vegas(vegas: dict[str, Any]) -> dict[str, Any] | None:
+    """Invert `_build_vegas`: the simple fields behind a `view_vegas` object.
+
+    Returns None when the chart has a shape this server doesn't build (e.g. one
+    made with several measures on both axes in the Mode editor).
+    """
+    chart_type = vegas.get("chartType")
+    encoding = vegas.get("encoding") or {}
+    marks = encoding.get("marks") or {}
+
+    def columns(items: list[dict[str, Any]], aggregated: bool = False) -> list[str]:
+        pattern = r"SUM\(\[(.+)\]\)" if aggregated else r"\[(.+)\]"
+        found = [re.fullmatch(pattern, i.get("formula", "")) for i in items]
+        if not found or not all(found):
+            raise ValueError
+        return [m.group(1) for m in found if m]
+
+    def values(props: dict[str, Any], name: str) -> list[dict[str, Any]]:
+        return (props.get(name) or {}).get("values", [])
+
+    try:
+        props = marks.get("properties") or {}
+        if chart_type in ("line", "area", "bar", "stackedBar", "hBar", "hStackedBar"):
+            horizontal = chart_type in ("hBar", "hStackedBar")
+            series = (marks.get("series") or [{}])[0].get("properties") or {}
+            color_items = [i for i in values(series, "color") if i["formula"] != "$NAMES"]
+            transform = next(iter((series.get("options") or {}).values()), {}).get("transform")
+            return {
+                "type": "bar" if chart_type.lower().endswith("bar") else chart_type,
+                "x": columns(encoding["y" if horizontal else "x"])[0],
+                "y": columns(encoding.get("value", []), aggregated=True),
+                "color": columns(color_items)[0] if color_items else None,
+                "stacked": chart_type in ("stackedBar", "hStackedBar") or transform == "stack",
+                "horizontal": horizontal,
+            }
+        if chart_type == "pie":
+            return {
+                "type": "pie",
+                "x": columns(values(props, "color"))[0],
+                "y": columns(values(props, "angle"), aggregated=True),
+                "color": None, "stacked": False, "horizontal": False,
+            }
+        if chart_type == "bigValue":
+            return {
+                "type": "big_number", "x": None,
+                "y": columns(values(props, "text"), aggregated=True),
+                "color": None, "stacked": False, "horizontal": False,
+            }
+        if chart_type == "table":
+            return {
+                "type": "table", "x": None, "y": columns(values(props, "text")),
+                "color": None, "stacked": False, "horizontal": False,
+            }
+    except (KeyError, IndexError, ValueError):
+        return None
+    return None
+
+
+async def _palette(
+    client: httpx.AsyncClient, token: str | None
+) -> tuple[str, list[str]]:
+    """A color palette's token and colors; the workspace default if no token."""
+    if token is None:
+        resp = await client.get("/color_palettes")
+        _check(resp)
+        default = next(
+            (p for p in _embedded(resp.json(), "color_palettes") if p.get("is_default")),
+            None,
+        )
+        token = default["token"] if default else MODE_DEFAULT_PALETTE
+    resp = await client.get(f"/color_palettes/{token}")
+    _check(resp)
+    return token, [c.strip() for c in resp.json().get("value", "").split(",") if c.strip()]
+
+
+def _field_colors(
+    vegas: dict[str, Any], token: str, colors: list[str]
+) -> dict[str, Any]:
+    """`fieldColors` entries for every field the chart colors by.
+
+    A `$NAMES` split colors by measure, so its map is the y column names in
+    order; a column split would need its distinct values, which Mode fills in
+    when it renders.
+    """
+    encoding = vegas.get("encoding") or {}
+    marks = encoding.get("marks") or {}
+    names = [
+        m.group(1)
+        for i in encoding.get("value") or []
+        if (m := re.fullmatch(r"SUM\(\[(.+)\]\)", i.get("formula", "")))
+    ]
+    holders = [s.get("properties") or {} for s in marks.get("series") or []]
+    holders.append(marks.get("properties") or {})
+    out: dict[str, Any] = {}
+    for props in holders:
+        for item in (props.get("color") or {}).get("values", []):
+            formula = item["formula"]
+            out[f"@DIS_{formula}"] = {
+                "colorPaletteToken": token,
+                "palette": colors,
+                "map": {n: i for i, n in enumerate(names)} if formula == "$NAMES" else {},
+            }
+    return out
+
+
+def _with_color_defaults(
+    vegas: dict[str, Any], token: str, colors: list[str]
+) -> dict[str, Any]:
+    """Fill in Mode's default format and color settings, keeping what's set.
+
+    Mode's UI breaks on a chart without `format` (including `format.colors`)
+    and `fieldColors`, so anything missing is added and nothing set is changed.
+    """
+    defaults = _deep_merge(
+        DEFAULT_FORMAT,
+        {
+            "useMuzeRenderer": vegas.get("chartType") not in ("table", "bigValue"),
+            "colors": {"theme": token, "custom": colors, "map": {}},
+        },
+    )
+    return {
+        **vegas,
+        "format": _deep_merge(defaults, vegas.get("format") or {}),
+        "fieldColors": {
+            **_field_colors(vegas, token, colors),
+            **(vegas.get("fieldColors") or {}),
+        },
+    }
+
+
+def _form_path(chart: dict[str, Any], form: str, workspace: str) -> str:
+    """A HAL form's action as a path relative to the client's base URL."""
+    action = chart["_forms"][form]["action"]
+    return action.removeprefix(f"/api/{workspace}")
+
+
+async def _save_vegas(
+    client: httpx.AsyncClient, path: str, vegas: dict[str, Any], palette_token: str
+) -> dict[str, Any]:
+    """PATCH a chart's `view_vegas` and palette. Mode only takes `view_vegas` as a JSON string."""
+    resp = await client.patch(
+        path,
+        json={
+            "visualization": {
+                "view_vegas": json.dumps(vegas),
+                "view_version": 2,
+                "color_palette_token": palette_token,
+            }
+        },
+    )
+    _check(resp)
+    return resp.json()
+
+
+@mcp.tool()
+async def create_chart(
+    ctx: Context,
+    report_token: str,
+    query_token: str,
+    type: ChartType,
+    x: str | None = None,
+    y: list[str] | None = None,
+    color: str | None = None,
+    title: str | None = None,
+    stacked: bool = False,
+    orientation: Orientation = "vertical",
+    view: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Add a chart to a query. Uses an undocumented Mode endpoint; may break without notice.
+
+    Column names are checked against the query's latest succeeded run (run
+    the report first), case-insensitively. Each y column is plotted as SUM(y).
+    Check the result in Mode's UI: this server can't render the chart.
+
+    Args:
+        report_token: The report token.
+        query_token: The query that feeds the chart.
+        type: line, bar, area, pie, table or big_number.
+        x: Category/x-axis column. For a pie, the slice column; for a table,
+            an optional first column.
+        y: Value columns. For a pie or big_number only the first is used; for
+            a table they are the remaining columns.
+        color: Column that splits the series by color (line, bar, area).
+        title: Chart title.
+        stacked: Stack bars or areas instead of grouping them.
+        orientation: "horizontal" swaps the axes of a bar chart.
+        view: Raw `view_vegas` object, usually copied from
+            get_chart(include_vegas=True) and edited. Merged over the fields
+            above, so it wins where they overlap.
+    """
+    mode = _mode(ctx)
+    y = y or []
+    wanted = [c for c in [x, color, *y] if c]
+    if wanted:
+        available = await _latest_columns(mode.client, report_token, query_token)
+        resolved = dict(zip(wanted, _resolve_columns(wanted, available)))
+        x, color = resolved.get(x or ""), resolved.get(color or "")
+        y = [resolved[c] for c in y]
+    vegas = _build_vegas(type, x, y, color, title, stacked, orientation == "horizontal")
+
+    base = f"/reports/{report_token}/queries/{query_token}/charts"
+    created = await mode.client.post(base, json={"chart": {"view_version": 2}})
+    _check(created)
+    chart = created.json()
+    try:
+        palette_token, palette_colors = await _palette(
+            mode.client, chart.get("color_palette_token")
+        )
+        vegas = _with_color_defaults(vegas, palette_token, palette_colors)
+        if view:
+            vegas = _deep_merge(vegas, view)
+        saved = await _save_vegas(
+            mode.client, _form_path(chart, "edit", mode.workspace), vegas, palette_token
+        )
+    except Exception:
+        await mode.client.delete(_form_path(chart, "destroy", mode.workspace))
+        raise
+    return {
+        **_chart_summary(saved),
+        "query_token": query_token,
+        "web_path": chart.get("_links", {}).get("report_viz_web", {}).get("href"),
+    }
+
+
+@mcp.tool()
+async def update_chart(
+    ctx: Context,
+    report_token: str,
+    query_token: str,
+    chart_token: str,
+    type: ChartType | None = None,
+    x: str | None = None,
+    y: list[str] | None = None,
+    color: str | None = None,
+    title: str | None = None,
+    stacked: bool | None = None,
+    orientation: Orientation | None = None,
+    view: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Change a chart. Uses an undocumented Mode endpoint; may break without notice.
+
+    Only the fields you pass change; the chart's colors, number formats and
+    other settings are kept. Any default format and color settings the chart is
+    missing (charts made by older versions of create_chart lack them, and
+    break in Mode's UI) are filled in on every call, so calling this with no
+    changes repairs such a chart. If you change type, x, y, color, stacked or
+    orientation, the rest of those are read back from the chart. A chart built
+    in Mode's editor with a shape this server can't read back needs all of
+    them passed, or the change made through `view`. Same arguments as create_chart.
+
+    Args:
+        report_token: The report token.
+        query_token: The query the chart is attached to.
+        chart_token: The chart token.
+        type: line, bar, area, pie, table or big_number.
+        x: Category/x-axis column.
+        y: Value columns.
+        color: Column that splits the series by color.
+        title: Chart title.
+        stacked: Stack bars or areas.
+        orientation: "horizontal" or "vertical" for a bar chart.
+        view: Raw `view_vegas` object merged over the result; it wins.
+    """
+    mode = _mode(ctx)
+    resp = await mode.client.get(
+        f"/reports/{report_token}/queries/{query_token}/charts/{chart_token}"
+    )
+    _check(resp)
+    chart = resp.json()
+    vegas = chart.get("view_vegas") or {}
+
+    fields = {"type": type, "x": x, "y": y, "color": color, "stacked": stacked}
+    if orientation is not None:
+        fields["horizontal"] = orientation == "horizontal"
+    if any(v is not None for v in fields.values()):
+        current = _describe_vegas(vegas)
+        if current is None:
+            required = {"type": type, "x": x, "y": y}
+            if type in ("big_number", "table"):
+                required.pop("x")
+            if any(v is None for v in required.values()):
+                raise ToolError(
+                    "This chart has a shape update_chart can't read back. Pass type, "
+                    "x and y together, or make the change through `view`."
+                )
+            current = {"color": None, "stacked": False, "horizontal": False}
+        merged = {**current, **{k: v for k, v in fields.items() if v is not None}}
+        named = [c for c in [x, color, *(y or [])] if c]
+        if named:
+            available = await _latest_columns(mode.client, report_token, query_token)
+            resolved = dict(zip(named, _resolve_columns(named, available)))
+            merged["x"] = resolved.get(x or "", merged.get("x"))
+            merged["color"] = resolved.get(color or "", merged.get("color"))
+            merged["y"] = [resolved[c] for c in y] if y else merged.get("y", [])
+        rebuilt = _build_vegas(
+            merged["type"], merged.get("x"), merged.get("y") or [], merged.get("color"),
+            None, merged["stacked"], merged["horizontal"],
+        )
+        old_encoding = vegas.get("encoding") or {}
+        vegas = {
+            **vegas,
+            "chartType": rebuilt["chartType"],
+            "encoding": {
+                **rebuilt["encoding"],
+                **{k: old_encoding[k] for k in ("filter", "totals", "groups") if k in old_encoding},
+            },
+        }
+    if title is not None:
+        vegas = {**vegas, "title": title}
+    palette_token, palette_colors = await _palette(
+        mode.client, chart.get("color_palette_token")
+    )
+    vegas = _with_color_defaults(vegas, palette_token, palette_colors)
+    if view:
+        vegas = _deep_merge(vegas, view)
+
+    saved = await _save_vegas(
+        mode.client, _form_path(chart, "edit", mode.workspace), vegas, palette_token
+    )
+    return {**_chart_summary(saved), "query_token": query_token}
 
 
 # ---------------------------------------------------------------------------
@@ -728,35 +1500,64 @@ async def update_query(
 # ---------------------------------------------------------------------------
 
 
+TERMINAL_RUN_STATES = frozenset({"succeeded", "failed", "cancelled", "completed"})
+
+
+def _project_rows(
+    rows: list[dict[str, Any]], columns: list[str]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Keep only `columns` (matched ignoring case) in each row.
+
+    Returns the projected rows and the requested names no column matched.
+    """
+    lookup = {c.lower(): c for c in rows[0]} if rows else {}
+    keep = {n: lookup[n.lower()] for n in columns if n.lower() in lookup}
+    missing = [n for n in columns if n not in keep]
+    return [{name: row[name] for name in keep.values()} for row in rows], missing
+
+
 async def _fetch_run_results(
     client: httpx.AsyncClient,
     report_token: str,
     run_token: str,
     max_rows_per_query: int | None = 500,
+    columns: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch results for all query runs in a report run."""
+    """Fetch results for all query runs in a report run.
+
+    Query runs that didn't succeed have no result file, so their warehouse
+    error is read from the query run itself. With `columns`, rows are cut down
+    to those columns before truncation, and names no column matched are listed
+    under `missing_columns`.
+    """
     qr_resp = await client.get(f"/reports/{report_token}/runs/{run_token}/query_runs")
     _check(qr_resp)
     query_runs = _embedded(qr_resp.json(), "query_runs")
 
     async def _fetch_one(qr: dict[str, Any]) -> dict[str, Any]:
         qr_token = qr["token"]
+        out: dict[str, Any] = {
+            "query_name": qr.get("query_name", ""),
+            "query_token": qr.get("query_token"),
+            "state": qr.get("state"),
+        }
+        if qr.get("state") != "succeeded":
+            out["error"] = qr.get("error_message")
+            out["error_code"] = qr.get("error_code")
+            return out
         r = await client.get(
             f"/reports/{report_token}/runs/{run_token}"
             f"/query_runs/{qr_token}/results/content.json"
         )
         if r.status_code != 200:
-            return {
-                "query_name": qr.get("query_name", ""),
-                "state": qr.get("state"),
-                "error": f"HTTP {r.status_code}",
-            }
+            out["error"] = f"HTTP {r.status_code}"
+            return out
         data = r.json()
-        out: dict[str, Any] = {
-            "query_name": qr.get("query_name", ""),
-            "state": qr.get("state"),
-        }
         if isinstance(data, list):
+            if columns:
+                data, missing = _project_rows(data, columns)
+                if missing:
+                    out["missing_columns"] = missing
             total = len(data)
             out["row_count"] = total
             if max_rows_per_query is not None and total > max_rows_per_query:
@@ -779,6 +1580,8 @@ async def get_run_results(
     report_token: str,
     run_token: str | None = None,
     max_rows_per_query: int | None = 500,
+    include_failed: bool = False,
+    columns: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Get results from a report run. Defaults to the latest run.
 
@@ -789,10 +1592,19 @@ async def get_run_results(
 
     Args:
         report_token: The report token.
-        run_token: Specific run token. If omitted, uses the latest succeeded run.
+        run_token: Specific run token. If omitted, uses the latest succeeded run,
+            or the latest run of any state when `include_failed` is set.
         max_rows_per_query: Max rows to return per query. Default 500. Pass null
             to fetch every row — can be very large (hundreds of MB) for
             dashboards with long time-series or wide cross-tabs.
+        include_failed: When no run_token is given, use the latest run of any
+            state instead of the latest succeeded one. Failed queries report
+            their warehouse `error` and the `query_token` to fix with
+            update_query.
+        columns: Only return these columns (matched ignoring case). Saves
+            context and keeps other columns, e.g. emails, out of the
+            transcript. Names that match nothing are listed in
+            `missing_columns`.
     """
     mode = _mode(ctx)
     if not run_token:
@@ -802,14 +1614,115 @@ async def get_run_results(
         )
         _check(runs_resp)
         runs = _embedded(runs_resp.json(), "report_runs")
-        succeeded = [r for r in runs if r.get("state") == "succeeded"]
-        if not succeeded:
-            raise ToolError("No succeeded runs found for this report.")
-        run_token = succeeded[0]["token"]
+        if include_failed:
+            if not runs:
+                raise ToolError("No runs found for this report.")
+            run_token = runs[0]["token"]
+        else:
+            succeeded = [r for r in runs if r.get("state") == "succeeded"]
+            if not succeeded:
+                raise ToolError("No succeeded runs found for this report.")
+            run_token = succeeded[0]["token"]
 
     return await _fetch_run_results(
-        mode.client, report_token, run_token, max_rows_per_query
+        mode.client, report_token, run_token, max_rows_per_query, columns
     )
+
+
+def _parameter_report(
+    requested: dict[str, Any] | None, run: dict[str, Any]
+) -> dict[str, Any]:
+    """`applied_parameters` and any `warnings` about parameters Mode may have ignored.
+
+    Mode records the parameters it was sent even when the report has no form
+    field to bind them to, so a run with no registered form fields is the signal.
+    """
+    out: dict[str, Any] = {}
+    if "parameters" in run:
+        out["applied_parameters"] = run["parameters"]
+    if requested and "form_fields" in run and not run["form_fields"]:
+        out["warnings"] = [
+            f"Parameters {sorted(requested)} were sent, but this report has no registered "
+            "form fields, so Mode probably ran with the form defaults. Declare them in a "
+            "{% form %} block in a query's SQL and save the query in Mode."
+        ]
+    return out
+
+
+@mcp.tool()
+async def run_report(
+    ctx: Context,
+    report_token: str,
+    parameters: dict[str, Any] | None = None,
+    wait: bool = True,
+    timeout_seconds: int = 120,
+    max_rows_per_query: int | None = 50,
+    columns: list[str] | None = None,
+) -> dict[str, Any]:
+    """Run a report and return per-query results, including warehouse errors.
+
+    This is a write operation: it runs EVERY query in the report, which spends
+    warehouse compute and adds to the report's run history. It is meant for
+    checking that SQL works, so rows are truncated to a small default; keep
+    reports small (or split them) while iterating.
+
+    The API can't run a single query. To iterate on one expensive query, put it
+    in a scratch report on its own and run that.
+
+    A failed query reports its `error` and `query_token`, which maps straight
+    to update_query. If the run is still going after `timeout_seconds`, returns
+    `timed_out: true`; follow up with get_run_results.
+
+    `applied_parameters` is what Mode recorded for the run. Parameters only
+    take effect when the report has registered form fields (a `{% form %}`
+    block in a query's SQL, saved in Mode); otherwise the defaults apply and
+    the result carries a `warnings` entry.
+
+    Args:
+        report_token: The report token.
+        parameters: Mode form values, e.g. {"weeks": 8}. If omitted, the
+            report's form defaults apply.
+        wait: Poll until the run finishes (default). If false, return the
+            run_token and state immediately.
+        timeout_seconds: Max seconds to wait for the run to finish.
+        max_rows_per_query: Max rows to return per query. Default 50. Pass null
+            to fetch every row.
+        columns: Only return these columns (matched ignoring case); names that
+            match nothing are listed in `missing_columns`.
+    """
+    mode = _mode(ctx)
+    resp = await mode.client.post(
+        f"/reports/{report_token}/runs",
+        json={"parameters": parameters} if parameters else {},
+    )
+    _check(resp)
+    run = resp.json()
+    run_token = run["token"]
+    state = run.get("state")
+    if not wait:
+        return {"run_token": run_token, "state": state, **_parameter_report(parameters, run)}
+
+    deadline = time.monotonic() + timeout_seconds
+    delay = 1.0
+    while state not in TERMINAL_RUN_STATES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"run_token": run_token, "state": "running", "timed_out": True}
+        await asyncio.sleep(min(delay, remaining))
+        delay = min(delay * 1.5, 5.0)
+        poll = await mode.client.get(f"/reports/{report_token}/runs/{run_token}")
+        _check(poll)
+        run = poll.json()
+        state = run.get("state")
+
+    return {
+        "run_token": run_token,
+        "state": state,
+        **_parameter_report(parameters, run),
+        "queries": await _fetch_run_results(
+            mode.client, report_token, run_token, max_rows_per_query, columns
+        ),
+    }
 
 
 
@@ -822,6 +1735,9 @@ WRITE_TOOLS = frozenset({
     "update_query",
     "delete_query",
     "delete_report",
+    "run_report",
+    "create_chart",
+    "update_chart",
 })
 
 DELETE_TOOLS = frozenset({"delete_query", "delete_report"})
