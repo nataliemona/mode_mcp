@@ -414,7 +414,7 @@ async def test_get_report():
     )
 
     async with _test_client() as client:
-        result = await server.get_report(_mock_ctx(client), "rpt1")
+        result = await server.get_report(_mock_ctx(client), "rpt1", include_charts=True)
     assert result["token"] == "rpt1"
     assert len(result["queries"]) == 1
     assert "SELECT" in result["queries"][0]["raw_query"]
@@ -439,7 +439,7 @@ async def test_get_report_survives_chart_fetch_failure():
     )
 
     async with _test_client() as client:
-        result = await server.get_report(_mock_ctx(client), "rpt1")
+        result = await server.get_report(_mock_ctx(client), "rpt1", include_charts=True)
     assert result["queries"][0]["charts"] is None
 
 
@@ -946,12 +946,23 @@ async def test_archive_and_unarchive_report():
 ALL_TOOLS = {"list_spaces", "get_report", *server.WRITE_TOOLS}
 
 
-def test_disabled_tools_deletes_off_by_default():
-    assert server._disabled_tools({}, ALL_TOOLS) == server.DELETE_TOOLS
+def test_disabled_tools_deletes_and_runs_off_by_default():
+    assert server._disabled_tools({}, ALL_TOOLS) == server.DELETE_TOOLS | server.RUN_TOOLS
 
 
 def test_disabled_tools_enable_deletes():
-    assert server._disabled_tools({"MODE_ENABLE_DELETES": "true"}, ALL_TOOLS) == set()
+    env = {"MODE_ENABLE_DELETES": "true"}
+    assert server._disabled_tools(env, ALL_TOOLS) == server.RUN_TOOLS
+
+
+def test_disabled_tools_enable_runs():
+    env = {"MODE_ENABLE_RUNS": "true"}
+    assert server._disabled_tools(env, ALL_TOOLS) == server.DELETE_TOOLS
+
+
+def test_disabled_tools_read_only_wins_over_enable_runs():
+    env = {"MODE_READ_ONLY": "true", "MODE_ENABLE_RUNS": "true"}
+    assert "run_report" in server._disabled_tools(env, ALL_TOOLS)
 
 
 
@@ -963,6 +974,7 @@ def test_disabled_tools_read_only_wins_over_enable_deletes():
 def test_disabled_tools_list():
     env = {
         "MODE_ENABLE_DELETES": "true",
+        "MODE_ENABLE_RUNS": "true",
         "MODE_DISABLED_TOOLS": " create_report, add_query ,",
     }
     assert server._disabled_tools(env, ALL_TOOLS) == {"create_report", "add_query"}
@@ -1348,6 +1360,76 @@ def _mock_query_runs(run_token="run1", state="succeeded", **extra):
     )
 
 
+def _mock_run_preview(queries=None, runs=None):
+    if queries is None:
+        queries = [{"token": "q1", "name": "big", "raw_query": "SELECT 1", "data_source_id": 1}]
+    respx.get(f"{BASE}/reports/rpt1/queries").mock(
+        return_value=httpx.Response(200, json=_hal("queries", queries))
+    )
+    respx.get(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(200, json=_hal("report_runs", runs or []))
+    )
+
+
+async def _confirmed_run(client, *args, **kwargs):
+    """Call run_report twice: once for the preview, then with its confirm_code."""
+    _mock_run_preview()
+    preview = await server.run_report(_mock_ctx(client), *args, **kwargs)
+    return await server.run_report(
+        _mock_ctx(client), *args, confirm_code=preview["confirm_code"], **kwargs
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_preview_runs_nothing():
+    _mock_run_preview(
+        runs=[
+            {"token": "r2", "state": "failed", "created_at": "2026-11-16T10:00:00Z", "completed_at": "2026-11-16T10:00:01Z"},
+            {"token": "r1", "state": "succeeded", "created_at": "2026-11-15T10:00:00Z", "completed_at": "2026-11-15T10:00:42.5Z"},
+        ]
+    )
+    post = respx.post(f"{BASE}/reports/rpt1/runs")
+
+    async with _test_client() as client:
+        result = await server.run_report(_mock_ctx(client), "rpt1", parameters={"weeks": 8})
+
+    assert post.called is False
+    assert result["confirm_required"] is True
+    assert result["query_count"] == 1
+    assert result["queries"][0]["name"] == "big"
+    assert result["last_run_seconds"] == 42.5
+    assert result["parameters"] == {"weeks": 8}
+    assert len(result["confirm_code"]) == 8
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_wrong_code_runs_nothing():
+    _mock_run_preview()
+    post = respx.post(f"{BASE}/reports/rpt1/runs")
+
+    async with _test_client() as client:
+        with pytest.raises(ToolError, match="confirm_code does not match"):
+            await server.run_report(_mock_ctx(client), "rpt1", confirm_code="deadbeef")
+
+    assert post.called is False
+
+
+def test_run_confirm_code_changes_with_sql_source_and_parameters():
+    q = {"token": "q1", "raw_query": "SELECT 1", "data_source_id": 1}
+    base = server._run_confirm_code("rpt1", [q], {"weeks": 8})
+    assert server._run_confirm_code("rpt1", [{**q, "raw_query": "SELECT 2"}], {"weeks": 8}) != base
+    assert server._run_confirm_code("rpt1", [{**q, "data_source_id": 2}], {"weeks": 8}) != base
+    assert server._run_confirm_code("rpt1", [q, {**q, "token": "q2"}], {"weeks": 8}) != base
+    assert server._run_confirm_code("rpt1", [q], {"weeks": 520}) != base
+
+
+def test_run_confirm_code_treats_no_parameters_as_empty():
+    q = {"token": "q1", "raw_query": "SELECT 1", "data_source_id": 1}
+    assert server._run_confirm_code("rpt1", [q], None) == server._run_confirm_code("rpt1", [q], {})
+
+
 @pytest.mark.asyncio
 @respx.mock
 async def test_run_report_polls_until_succeeded(fake_clock):
@@ -1366,8 +1448,7 @@ async def test_run_report_polls_until_succeeded(fake_clock):
     ).mock(return_value=httpx.Response(200, json=[{"i": i} for i in range(200)]))
 
     async with _test_client() as client:
-        result = await server.run_report(
-            _mock_ctx(client), "rpt1", parameters={"weeks": 8}
+        result = await _confirmed_run(client, "rpt1", parameters={"weeks": 8}
         )
 
     assert json.loads(post.calls[0].request.content) == {"parameters": {"weeks": 8}}
@@ -1390,7 +1471,7 @@ async def test_run_report_without_parameters_posts_empty_body(fake_clock):
     _mock_query_runs(state="failed", error_message="bad column")
 
     async with _test_client() as client:
-        result = await server.run_report(_mock_ctx(client), "rpt1")
+        result = await _confirmed_run(client, "rpt1")
 
     assert json.loads(post.calls[0].request.content) == {}
     assert result["state"] == "failed"
@@ -1408,13 +1489,31 @@ async def test_run_report_times_out(fake_clock):
     )
 
     async with _test_client() as client:
-        result = await server.run_report(
-            _mock_ctx(client), "rpt1", timeout_seconds=10
+        result = await _confirmed_run(client, "rpt1", timeout_seconds=10
         )
 
     assert result == {"run_token": "run1", "state": "running", "timed_out": True}
     assert fake_clock["now"] == 10
     assert max(fake_clock["sleeps"]) <= 5.0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_report_times_out_with_real_state_and_parameter_report(fake_clock):
+    respx.post(f"{BASE}/reports/rpt1/runs").mock(
+        return_value=httpx.Response(
+            200,
+            json={"token": "run1", "state": "enqueued", "parameters": {"weeks": "2"}, "form_fields": []},
+        )
+    )
+
+    async with _test_client() as client:
+        result = await _confirmed_run(client, "rpt1", parameters={"weeks": 2}, timeout_seconds=0)
+
+    assert result["state"] == "enqueued"
+    assert result["timed_out"] is True
+    assert result["applied_parameters"] == {"weeks": "2"}
+    assert "weeks" in result["warnings"][0]
 
 
 @pytest.mark.asyncio
@@ -1428,7 +1527,7 @@ async def test_run_report_no_wait_does_not_poll(fake_clock):
     )
 
     async with _test_client() as client:
-        result = await server.run_report(_mock_ctx(client), "rpt1", wait=False)
+        result = await _confirmed_run(client, "rpt1", wait=False)
 
     assert result == {"run_token": "run1", "state": "pending"}
     assert poll.called is False
@@ -1524,7 +1623,7 @@ def test_build_vegas_requires_columns(chart_type, x, y, message):
         dict(type="bar", x="P", y=["A"], color=None, stacked=True, horizontal=True),
         dict(type="pie", x="P", y=["A"], color=None, stacked=False, horizontal=False),
         dict(type="big_number", x=None, y=["A"], color=None, stacked=False, horizontal=False),
-        dict(type="table", x=None, y=["A", "B"], color=None, stacked=False, horizontal=False),
+        dict(type="table", x="A", y=["B"], color=None, stacked=False, horizontal=False),
     ],
 )
 def test_describe_vegas_inverts_build_vegas(fields):
@@ -1813,8 +1912,7 @@ async def test_run_report_warns_when_no_form_fields_registered(fake_clock):
     ).mock(return_value=httpx.Response(200, json=[{"a": 1}]))
 
     async with _test_client() as client:
-        result = await server.run_report(
-            _mock_ctx(client), "rpt1", parameters={"weeks": 2}
+        result = await _confirmed_run(client, "rpt1", parameters={"weeks": 2}
         )
 
     assert result["applied_parameters"] == {"weeks": "2"}
@@ -1843,8 +1941,7 @@ async def test_run_report_no_warning_with_registered_form_fields(fake_clock):
     ).mock(return_value=httpx.Response(200, json=[{"a": 1}]))
 
     async with _test_client() as client:
-        result = await server.run_report(
-            _mock_ctx(client), "rpt1", parameters={"weeks": 2}
+        result = await _confirmed_run(client, "rpt1", parameters={"weeks": 2}
         )
 
     assert result["applied_parameters"] == {"weeks": "2"}
@@ -1865,7 +1962,7 @@ async def test_run_report_no_warning_without_parameters_or_form_data(fake_clock)
     ).mock(return_value=httpx.Response(200, json=[]))
 
     async with _test_client() as client:
-        plain = await server.run_report(_mock_ctx(client), "rpt1")
+        plain = await _confirmed_run(client, "rpt1")
     assert "warnings" not in plain
     assert "applied_parameters" not in plain
 
@@ -1924,7 +2021,7 @@ async def test_run_report_columns(fake_clock):
     ).mock(return_value=httpx.Response(200, json=[{"EMAIL": "a@x.com", "N": 1}]))
 
     async with _test_client() as client:
-        result = await server.run_report(_mock_ctx(client), "rpt1", columns=["n"])
+        result = await _confirmed_run(client, "rpt1", columns=["n"])
 
     assert result["queries"][0]["data"] == [{"N": 1}]
 
@@ -2129,3 +2226,60 @@ async def test_palette_falls_back_to_modes_predefined_default():
 
     assert token == server.MODE_DEFAULT_PALETTE
     assert colors == ["#111111", "#222222"]
+
+
+def test_kept_sorts_keeps_sorts_on_bound_formulas_only():
+    encoding = server._build_vegas("bar", "week", ["signups"], "browser", None, False, False)["encoding"]
+    sorts = [
+        {"type": "DATA", "source": "[week]", "descending": True},
+        {"type": "DATA", "source": "SUM([signups])", "descending": False},
+        {"type": "DATA", "source": "SUM([sessions])", "descending": True},
+    ]
+    assert server._kept_sorts(sorts, encoding) == sorts[:2]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_report_skips_charts_by_default():
+    respx.get(f"{BASE}/reports/rpt1").mock(
+        return_value=httpx.Response(200, json={"token": "rpt1", "name": "R"})
+    )
+    respx.get(f"{BASE}/reports/rpt1/queries").mock(
+        return_value=httpx.Response(200, json=_hal("queries", [{"token": "q1", "name": "revenue"}]))
+    )
+    charts = respx.get(f"{BASE}/reports/rpt1/queries/q1/charts")
+
+    async with _test_client() as client:
+        result = await server.get_report(_mock_ctx(client), "rpt1")
+
+    assert charts.called is False
+    assert "charts" not in result["queries"][0]
+
+
+def test_describe_vegas_table_round_trips_first_column_as_x():
+    vegas = server._build_vegas("table", "week", ["sessions", "signups"], None, None, False, False)
+    described = server._describe_vegas(vegas)
+    assert described["x"] == "week"
+    assert described["y"] == ["sessions", "signups"]
+    rebuilt = server._build_vegas("table", described["x"], described["y"], None, None, False, False)
+    assert [i["formula"] for i in rebuilt["encoding"]["marks"]["properties"]["text"]["values"]] == [
+        "[week]", "[sessions]", "[signups]",
+    ]
+
+
+def test_api_path_strips_workspace_prefix():
+    assert server._api_path(f"/api/{WORKSPACE}/reports/r1/runs/x", WORKSPACE) == "/reports/r1/runs/x"
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "https://evil.example/api/x",
+        f"https://app.mode.com/api/{WORKSPACE}/reports/r1",
+        "/api/other_workspace/reports/r1",
+        f"/api/{WORKSPACE}evil/reports/r1",
+    ],
+)
+def test_api_path_refuses_links_outside_the_workspace(href):
+    with pytest.raises(ToolError, match="Refusing to follow"):
+        server._api_path(href, WORKSPACE)

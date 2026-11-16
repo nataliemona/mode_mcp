@@ -9,6 +9,7 @@ Env vars:
     MODE_API_SECRET      — API secret
     MODE_ENABLE_DELETES  — "true" to enable delete_report and delete_query
                            (off by default)
+    MODE_ENABLE_RUNS     — "true" to enable run_report (off by default)
     MODE_READ_ONLY       — "true" to disable every tool that writes to Mode
     MODE_DISABLED_TOOLS  — comma-separated tool names to disable, e.g.
                            "delete_report,delete_query"
@@ -25,6 +26,7 @@ import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 import httpx
@@ -110,6 +112,18 @@ def _check(resp: httpx.Response) -> None:
         if detail:
             msg = f"{msg} Detail: {detail}"
         raise ToolError(msg) from exc
+
+
+def _api_path(href: str, workspace: str) -> str:
+    """A link from a Mode response as a path relative to the client's base URL.
+
+    The client sends credentials with every request, so only paths inside
+    this workspace's API are followed.
+    """
+    prefix = f"/api/{workspace}/"
+    if not href.startswith(prefix):
+        raise ToolError(f"Refusing to follow a link outside {prefix}: {href!r}")
+    return href.removeprefix(prefix[:-1])
 
 
 def _embedded(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
@@ -277,7 +291,7 @@ async def _report_parameters(
     if not href:
         return None
     try:
-        resp = await mode.client.get(href.removeprefix(f"/api/{mode.workspace}"))
+        resp = await mode.client.get(_api_path(href, mode.workspace))
         _check(resp)
     except (httpx.HTTPError, ToolError):
         return None
@@ -285,8 +299,10 @@ async def _report_parameters(
 
 
 @mcp.tool()
-async def get_report(ctx: Context, report_token: str) -> dict[str, Any]:
-    """Get a report's details, its queries (SQL) and their charts.
+async def get_report(
+    ctx: Context, report_token: str, include_charts: bool = False
+) -> dict[str, Any]:
+    """Get a report's details and its queries (SQL), optionally with their charts.
 
     `parameters` are the form fields Mode has registered for the report (as
     recorded on its latest run), i.e. what run_report can take as `parameters`.
@@ -295,6 +311,8 @@ async def get_report(ctx: Context, report_token: str) -> dict[str, Any]:
 
     Args:
         report_token: The report token.
+        include_charts: Also list each query's charts. Costs one request per
+            query; list_charts gives the same for one report or query.
     """
     mode = _mode(ctx)
     report_resp, queries_resp = await asyncio.gather(
@@ -306,9 +324,13 @@ async def get_report(ctx: Context, report_token: str) -> dict[str, Any]:
 
     report = report_resp.json()
     queries = _embedded(queries_resp.json(), "queries")
-    charts_by_query = await asyncio.gather(
-        *[_fetch_charts(mode.client, report_token, q["token"]) for q in queries],
-        return_exceptions=True,
+    charts_by_query: list[Any] = (
+        await asyncio.gather(
+            *[_fetch_charts(mode.client, report_token, q["token"]) for q in queries],
+            return_exceptions=True,
+        )
+        if include_charts
+        else [None] * len(queries)
     )
     parameters = await _report_parameters(mode, report)
 
@@ -327,10 +349,14 @@ async def get_report(ctx: Context, report_token: str) -> dict[str, Any]:
                 "creator": _creator(q),
                 "raw_query": q.get("raw_query", ""),
                 "data_source_id": q.get("data_source_id"),
-                "charts": (
-                    None
-                    if isinstance(charts, BaseException)
-                    else [_chart_summary(c) for c in charts]
+                **(
+                    {
+                        "charts": None
+                        if isinstance(charts, BaseException)
+                        else [_chart_summary(c) for c in charts]
+                    }
+                    if include_charts
+                    else {}
                 ),
             }
             for q, charts in zip(queries, charts_by_query)
@@ -830,13 +856,35 @@ def _describe_vegas(vegas: dict[str, Any]) -> dict[str, Any] | None:
                 "color": None, "stacked": False, "horizontal": False,
             }
         if chart_type == "table":
+            first, *rest = columns(values(props, "text"))
             return {
-                "type": "table", "x": None, "y": columns(values(props, "text")),
+                "type": "table", "x": first, "y": rest,
                 "color": None, "stacked": False, "horizontal": False,
             }
     except (KeyError, IndexError, ValueError):
         return None
     return None
+
+
+def _encoding_formulas(encoding: dict[str, Any]) -> set[str]:
+    """Every formula bound anywhere in a `view_vegas` encoding."""
+    items = [i for channel in ENCODING_CHANNELS for i in encoding.get(channel) or []]
+    marks = encoding.get("marks") or {}
+    for props in [s.get("properties") or {} for s in marks.get("series") or []] + [
+        marks.get("properties") or {}
+    ]:
+        for prop in props.values():
+            if isinstance(prop, dict):
+                items.extend(prop.get("values") or [])
+    return {i.get("formula") for i in items if isinstance(i, dict)}
+
+
+def _kept_sorts(
+    sorts: list[dict[str, Any]], encoding: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The sorts whose source is still bound in the rebuilt encoding."""
+    formulas = _encoding_formulas(encoding)
+    return [s for s in sorts if s.get("source") in formulas]
 
 
 async def _palette(
@@ -913,8 +961,7 @@ def _with_color_defaults(
 
 def _form_path(chart: dict[str, Any], form: str, workspace: str) -> str:
     """A HAL form's action as a path relative to the client's base URL."""
-    action = chart["_forms"][form]["action"]
-    return action.removeprefix(f"/api/{workspace}")
+    return _api_path(chart["_forms"][form]["action"], workspace)
 
 
 async def _save_vegas(
@@ -1086,6 +1133,7 @@ async def update_chart(
             "encoding": {
                 **rebuilt["encoding"],
                 **{k: old_encoding[k] for k in ("filter", "totals", "groups") if k in old_encoding},
+                "sorts": _kept_sorts(old_encoding.get("sorts") or [], rebuilt["encoding"]),
             },
         }
     if title is not None:
@@ -1254,7 +1302,7 @@ def _verify_confirm_code(given: str, expected: str, tool: str) -> None:
         raise ToolError(
             f"confirm_code does not match. The resource may have changed since the "
             f"preview, or the code is wrong. Call {tool} again without confirm_code "
-            f"to get a fresh preview, show it to the user, and only then delete."
+            f"to get a fresh preview, show it to the user, and only then call it with the new code."
         )
 
 
@@ -1649,11 +1697,42 @@ def _parameter_report(
     return out
 
 
+def _run_seconds(run: dict[str, Any]) -> float | None:
+    """How long a run took, or None if its timestamps are missing."""
+    try:
+        started = datetime.fromisoformat(run["created_at"])
+        finished = datetime.fromisoformat(run["completed_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return round((finished - started).total_seconds(), 1)
+
+
+def _run_confirm_code(
+    report_token: str,
+    queries: list[dict[str, Any]],
+    parameters: dict[str, Any] | None,
+) -> str:
+    """Fingerprint of what a run_report preview showed.
+
+    Changes when a query is added, removed, edited or moved to another data
+    source, or when the parameters change.
+    """
+    return _confirm_code(
+        report_token,
+        sorted(
+            (q.get("token"), q.get("raw_query"), q.get("data_source_id"))
+            for q in queries
+        ),
+        parameters or {},
+    )
+
+
 @mcp.tool()
 async def run_report(
     ctx: Context,
     report_token: str,
     parameters: dict[str, Any] | None = None,
+    confirm_code: str | None = None,
     wait: bool = True,
     timeout_seconds: int = 120,
     max_rows_per_query: int | None = 50,
@@ -1665,6 +1744,12 @@ async def run_report(
     warehouse compute and adds to the report's run history. It is meant for
     checking that SQL works, so rows are truncated to a small default; keep
     reports small (or split them) while iterating.
+
+    Two steps, always:
+    1. Call without confirm_code. Returns a preview (the queries that will run,
+       the last run's duration, the parameters) and a confirm_code. Nothing runs.
+    2. Show the preview to the user and get their explicit approval. Only then
+       call again with the same parameters and the confirm_code from step 1.
 
     The API can't run a single query. To iterate on one expensive query, put it
     in a scratch report on its own and run that.
@@ -1682,6 +1767,7 @@ async def run_report(
         report_token: The report token.
         parameters: Mode form values, e.g. {"weeks": 8}. If omitted, the
             report's form defaults apply.
+        confirm_code: The code returned by the preview call. Never guess it.
         wait: Poll until the run finishes (default). If false, return the
             run_token and state immediately.
         timeout_seconds: Max seconds to wait for the run to finish.
@@ -1691,6 +1777,44 @@ async def run_report(
             match nothing are listed in `missing_columns`.
     """
     mode = _mode(ctx)
+    queries_resp, runs_resp = await asyncio.gather(
+        mode.client.get(f"/reports/{report_token}/queries"),
+        mode.client.get(
+            f"/reports/{report_token}/runs",
+            params={"order": "desc", "order_by": "created_at"},
+        ),
+    )
+    _check(queries_resp)
+    _check(runs_resp)
+    queries = _embedded(queries_resp.json(), "queries")
+    code = _run_confirm_code(report_token, queries, parameters)
+
+    if confirm_code is None:
+        last_succeeded = next(
+            (
+                r
+                for r in _embedded(runs_resp.json(), "report_runs")
+                if r.get("state") == "succeeded"
+            ),
+            None,
+        )
+        return {
+            "confirm_required": True,
+            "report_token": report_token,
+            "query_count": len(queries),
+            "queries": [
+                {"name": q.get("name", ""), "creator": _creator(q)} for q in queries
+            ],
+            "last_run_seconds": _run_seconds(last_succeeded) if last_succeeded else None,
+            "parameters": parameters,
+            "confirm_code": code,
+            "message": (
+                "Nothing was run. Show this to the user; if they approve, call "
+                "run_report again with the same parameters and this confirm_code."
+            ),
+        }
+
+    _verify_confirm_code(confirm_code, code, "run_report")
     resp = await mode.client.post(
         f"/reports/{report_token}/runs",
         json={"parameters": parameters} if parameters else {},
@@ -1707,7 +1831,12 @@ async def run_report(
     while state not in TERMINAL_RUN_STATES:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return {"run_token": run_token, "state": "running", "timed_out": True}
+            return {
+                "run_token": run_token,
+                "state": state,
+                "timed_out": True,
+                **_parameter_report(parameters, run),
+            }
         await asyncio.sleep(min(delay, remaining))
         delay = min(delay * 1.5, 5.0)
         poll = await mode.client.get(f"/reports/{report_token}/runs/{run_token}")
@@ -1742,6 +1871,8 @@ WRITE_TOOLS = frozenset({
 
 DELETE_TOOLS = frozenset({"delete_query", "delete_report"})
 
+RUN_TOOLS = frozenset({"run_report"})
+
 
 def _env_flag(env: Mapping[str, str], name: str) -> bool:
     return env.get(name, "").strip().lower() in {"1", "true", "yes"}
@@ -1752,6 +1883,8 @@ def _disabled_tools(env: Mapping[str, str], all_tools: set[str]) -> set[str]:
     disabled: set[str] = set()
     if not _env_flag(env, "MODE_ENABLE_DELETES"):
         disabled |= DELETE_TOOLS
+    if not _env_flag(env, "MODE_ENABLE_RUNS"):
+        disabled |= RUN_TOOLS
     if _env_flag(env, "MODE_READ_ONLY"):
         disabled |= WRITE_TOOLS
     names = {n.strip() for n in env.get("MODE_DISABLED_TOOLS", "").split(",") if n.strip()}

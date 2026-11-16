@@ -10,10 +10,10 @@ An MCP server that lets you browse reports, manage queries, and fetch results fr
 | `list_spaces` | List all spaces (collections) |
 | `list_reports` | List reports in a given space (archived ones hidden unless `include_archived=true`) |
 | `search_reports` | Search for reports by name or description across all spaces (client-side; archived ones hidden unless `include_archived=true`) |
-| `get_report` | Get report details including its SQL queries, who wrote each one, each query's charts, and the report's registered form `parameters` |
+| `get_report` | Get report details including its SQL queries, who wrote each one, and the report's registered form `parameters`. `include_charts=true` adds each query's charts |
 | `list_report_runs` | List recent runs for a report (state, timestamps) |
 | `get_run_results` | Fetch results from a specific or latest report run. Failed queries return their warehouse error and `query_token`; pass `include_failed=true` to read the latest run even if it failed. `columns` returns only the named columns |
-| `run_report` | Run a report and return per-query results or errors. Runs **every** query in the report (warehouse cost). Reports `applied_parameters` and warns when parameters were probably ignored. Off with `MODE_READ_ONLY` |
+| `run_report` | Run a report and return per-query results or errors. Runs **every** query in the report (warehouse cost). Reports `applied_parameters` and warns when parameters were probably ignored. Preview first, then confirm. Off unless `MODE_ENABLE_RUNS=true` |
 | `list_charts` | List the charts in a report (or on one query): token, type, title |
 | `get_chart` | Get one chart's type, title and what it plots; `include_vegas=true` adds the raw settings |
 | `create_chart` | Add a line, bar, area, pie, table or big-number chart to a query. **Undocumented endpoint** |
@@ -82,29 +82,31 @@ Some clients expand `${VAR}`, some use another syntax (e.g. `${env:VAR}`), and s
 | `MODE_API_TOKEN` | Yes | API token (from a Member API key, ideally) |
 | `MODE_API_SECRET` | Yes | API secret |
 | `MODE_ENABLE_DELETES` | No | Set to `true` to enable `delete_report` and `delete_query`. Off by default |
-| `MODE_READ_ONLY` | No | Set to `true` to disable every tool that writes to Mode (overrides `MODE_ENABLE_DELETES`) |
+| `MODE_ENABLE_RUNS` | No | Set to `true` to enable `run_report`. Off by default |
+| `MODE_READ_ONLY` | No | Set to `true` to disable every tool that writes to Mode (overrides `MODE_ENABLE_DELETES` and `MODE_ENABLE_RUNS`) |
 | `MODE_DISABLED_TOOLS` | No | Comma-separated tool names to disable, e.g. `create_report,update_query` |
 
 ### Choosing which tools are available
 
 Disabled tools are never registered, so the agent doesn't see them at all.
 
-- **Default:** everything except the two delete tools. The agent can browse, author, run, chart, and archive, but can't permanently delete anything.
+- **Default:** everything except the two delete tools and `run_report`. The agent can browse, author, chart, and archive, but can't permanently delete anything or run reports.
 - **Allow deletes:** add `"MODE_ENABLE_DELETES": "true"` to `env`.
-- **Read-only:** add `"MODE_READ_ONLY": "true"` to only allow browsing and fetching results. This also disables `run_report`, since running a report spends warehouse compute and adds run history.
+- **Allow runs:** add `"MODE_ENABLE_RUNS": "true"` to `env`.
+- **Read-only:** add `"MODE_READ_ONLY": "true"` to only allow browsing and fetching results. This also disables `run_report`, even with `MODE_ENABLE_RUNS=true`.
 - **Anything else:** list tool names in `MODE_DISABLED_TOOLS`.
 
 A misspelled tool name in `MODE_DISABLED_TOOLS` stops the server with an error rather than silently leaving the tool enabled.
 
 ## Limitations / Safety
 
-**Running reports.** The Mode API has no endpoint for running a single query. `run_report` calls `POST /reports/{token}/runs`, which runs **every** query in the report at once, spends warehouse compute, and adds to the report's run history.
+**Running reports.** The Mode API has no endpoint for running a single query. `run_report` calls `POST /reports/{token}/runs`, which runs **every** query in the report at once, spends warehouse compute, and adds to the report's run history. It is off unless you set `MODE_ENABLE_RUNS=true`.
+- Every run takes two calls. The first runs nothing and returns a preview (the queries that will run, the last run's duration, the parameters) and a `confirm_code`. The second call, with that code, starts the run. The code changes if a query is added, removed, edited or moved to another data source, or if the parameters change.
 - Keep reports small (or split them) while an agent iterates on SQL.
 - Rows are truncated to 50 per query by default, since the usual goal is checking that the SQL works. A failed query returns its warehouse error and `query_token`, which maps straight to `update_query`.
 - Parameters only take effect when the report has registered form fields: a `{% form %}` block in a query's SQL, saved in Mode. Queries created through the API aren't registered until someone saves them in the editor, and Mode then runs with the form defaults. `get_report` lists the registered `parameters`, and `run_report` warns when it sent parameters to a report with none.
 - `columns` keeps wide results (emails, impersonation links) out of the transcript.
 - If a run outlasts `timeout_seconds`, the result has `timed_out: true`; fetch it later with `get_run_results`.
-- To turn it off, set `MODE_READ_ONLY=true` or `MODE_DISABLED_TOOLS=run_report`.
 
 **Charts use undocumented endpoints.** Mode's public Charts API is read-only (`list_charts`, `get_chart`). `create_chart` and `update_chart` call the same endpoints Mode's own editor does (create a chart on a query, then patch its `view_vegas`), with your normal API token. They can break without notice; turn them off with `MODE_DISABLED_TOOLS=create_chart,update_chart` (or `MODE_READ_ONLY=true`).
 - Columns are checked against the query's latest succeeded run (run the report first), ignoring case. Each y column is plotted as `SUM(column)`.
